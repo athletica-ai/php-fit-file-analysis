@@ -1551,44 +1551,88 @@ class phpFITFileAnalysis
                         foreach ($this->defn_mesgs[$local_mesg_type]['field_defns'] as $field_defn) {
                             // Check that we have information on the Field Definition and a valid base type exists.
                             if (isset($this->data_mesg_info[$this->defn_mesgs[$local_mesg_type]['global_mesg_num']]['field_defns'][$field_defn['field_definition_number']]) && isset($this->types[$field_defn['base_type']])) {
+                                $base_type = $field_defn['base_type'];
+                                $global_mesg_num = $this->defn_mesgs[$local_mesg_type]['global_mesg_num'];
+
+                                if (!isset($this->types[$base_type])) {
+                                    throw new \RuntimeException("Unknown base type: $base_type");
+                                }
+
+                                // Dynamically set the format for base_type 7 (string)
+                                if ($base_type === 7) {
+                                    $format = 'a' . $field_defn['size'] . 'tmp';
+                                    $expectedBytes = $field_defn['size'];
+                                } else {
+                                    $format = $this->types[$base_type]['format'];
+                                    $expectedBytes = $this->types[$base_type]['bytes'];
+                                }
+
+                                $data = substr($this->file_contents, $this->file_pointer, $expectedBytes);
+                                if (strlen($data) < $expectedBytes) {
+                                    throw new \RuntimeException("Not enough bytes to unpack format '$format'. Expected $expectedBytes, got " . strlen($data) . " at offset {$this->file_pointer}, base_type $base_type, field_size {$field_defn['size']}");
+                                }
+
+                                $tmp_value = unpack($format, $data)['tmp'];
+                                //$tmp_value = unpack($this->types[$base_type]['format'], substr($this->file_contents, $this->file_pointer, $field_defn['size']))['tmp'];
+
                                 // Check if it's an invalid value for the type
-                                $tmp_value = unpack($this->types[$field_defn['base_type']]['format'], substr($this->file_contents, $this->file_pointer, $field_defn['size']))['tmp'];
-                                if ($tmp_value !== $this->invalid_values[$field_defn['base_type']] ||
-                                   $this->defn_mesgs[$local_mesg_type]['global_mesg_num'] === 132) {
+                                if ($tmp_value !== $this->invalid_values[$base_type] ||
+                                   $global_mesg_num === 132) {
                                     // If it's a timestamp, compensate between different in FIT and Unix timestamp epochs
                                     if ($field_defn['field_definition_number'] === 253 && !$this->garmin_timestamps) {
                                         $tmp_value += FIT_UNIX_TS_DIFF;
                                     }
 
                                     // If it's a Record data message, store all the pieces in the temporary array as the timestamp may not be first...
-                                    if ($this->defn_mesgs[$local_mesg_type]['global_mesg_num'] === 20) {
-                                        $tmp_record_array[$this->data_mesg_info[$this->defn_mesgs[$local_mesg_type]['global_mesg_num']]['field_defns'][$field_defn['field_definition_number']]['field_name']] = $tmp_value / $this->data_mesg_info[$this->defn_mesgs[$local_mesg_type]['global_mesg_num']]['field_defns'][$field_defn['field_definition_number']]['scale'] - $this->data_mesg_info[$this->defn_mesgs[$local_mesg_type]['global_mesg_num']]['field_defns'][$field_defn['field_definition_number']]['offset'];
-                                    } elseif ($this->defn_mesgs[$local_mesg_type]['global_mesg_num'] === 206) {  // Developer Data
-                                        $tmp_record_array[$this->data_mesg_info[$this->defn_mesgs[$local_mesg_type]['global_mesg_num']]['field_defns'][$field_defn['field_definition_number']]['field_name']] = $tmp_value;
+                                    if ($global_mesg_num === 20) {
+                                        $tmp_record_array[$this->data_mesg_info[$global_mesg_num]['field_defns'][$field_defn['field_definition_number']]['field_name']] = $tmp_value / $this->data_mesg_info[$global_mesg_num]['field_defns'][$field_defn['field_definition_number']]['scale'] - $this->data_mesg_info[$global_mesg_num]['field_defns'][$field_defn['field_definition_number']]['offset'];
+                                    } elseif ($global_mesg_num === 206) {  // Developer Data
+                                        $tmp_record_array[$this->data_mesg_info[$global_mesg_num]['field_defns'][$field_defn['field_definition_number']]['field_name']] = $tmp_value;
                                     } else {
-                                        if ($field_defn['base_type'] === 7) {  // Handle strings appropriately
-                                            $this->data_mesgs[$this->data_mesg_info[$this->defn_mesgs[$local_mesg_type]['global_mesg_num']]['mesg_name']][$this->data_mesg_info[$this->defn_mesgs[$local_mesg_type]['global_mesg_num']]['field_defns'][$field_defn['field_definition_number']]['field_name']][] = filter_var($tmp_value, FILTER_SANITIZE_STRING);
+                                        if ($base_type === 7) {  // Handle strings appropriately
+                                            $this->data_mesgs[$this->data_mesg_info[$global_mesg_num]['mesg_name']][$this->data_mesg_info[$global_mesg_num]['field_defns'][$field_defn['field_definition_number']]['field_name']][] = filter_var($tmp_value, FILTER_SANITIZE_STRING);
                                         } else {
                                             // Handle arrays
-                                            if ($field_defn['size'] !== $this->types[$field_defn['base_type']]['bytes']) {
+                                            if ($field_defn['size'] !== $this->types[$base_type]['bytes']) {
                                                 $tmp_array = [];
-                                                $num_vals = $field_defn['size'] / $this->types[$field_defn['base_type']]['bytes'];
-                                                for ($i=0; $i<$num_vals; ++$i) {
-                                                    $tmp_array[] = unpack($this->types[$field_defn['base_type']]['format'], substr($this->file_contents, $this->file_pointer + ($i * $this->types[$field_defn['base_type']]['bytes']), $field_defn['size']))['tmp']/ $this->data_mesg_info[$this->defn_mesgs[$local_mesg_type]['global_mesg_num']]['field_defns'][$field_defn['field_definition_number']]['scale'] - $this->data_mesg_info[$this->defn_mesgs[$local_mesg_type]['global_mesg_num']]['field_defns'][$field_defn['field_definition_number']]['offset'];
+                                                $num_vals = $field_defn['size'] / $this->types[$base_type]['bytes'];
+
+                                                for ($i = 0; $i < $num_vals; ++$i) {
+                                                    $offset_bytes = $this->file_pointer + ($i * $this->types[$base_type]['bytes']);
+                                                    $expected_bytes = $this->types[$base_type]['bytes'];
+                                                    $data = substr($this->file_contents, $offset_bytes, $expected_bytes);
+
+                                                    if (strlen($data) < $expected_bytes) {
+                                                        throw new \RuntimeException("Not enough bytes to unpack array value for base_type $base_type. Expected $expected_bytes bytes, got " . strlen($data) . " at offset $offset_bytes.");
+                                                    }
+
+                                                    // 💡 Add this logic for base_type 7
+                                                    $format = $this->types[$base_type]['format'];
+                                                    $value = unpack($format, $data)['tmp'];
+
+                                                    $scaled = $value / $this->data_mesg_info[$global_mesg_num]['field_defns'][$field_defn['field_definition_number']]['scale']
+                                                            - $this->data_mesg_info[$global_mesg_num]['field_defns'][$field_defn['field_definition_number']]['offset'];
+
+                                                    $tmp_array[] = $scaled;
                                                 }
-                                                $this->data_mesgs[$this->data_mesg_info[$this->defn_mesgs[$local_mesg_type]['global_mesg_num']]['mesg_name']][$this->data_mesg_info[$this->defn_mesgs[$local_mesg_type]['global_mesg_num']]['field_defns'][$field_defn['field_definition_number']]['field_name']][] = $tmp_array;
+
+//                                                for ($i=0; $i<$num_vals; ++$i) {
+//                                                    $tmp_array[] = unpack($this->types[$base_type]['format'], substr($this->file_contents, $this->file_pointer + ($i * $this->types[$base_type]['bytes']), $field_defn['size']))['tmp']/ $this->data_mesg_info[$global_mesg_num]['field_defns'][$field_defn['field_definition_number']]['scale'] - $this->data_mesg_info[$this->defn_mesgs[$local_mesg_type]['global_mesg_num']]['field_defns'][$field_defn['field_definition_number']]['offset'];
+//                                                }
+
+                                                $this->data_mesgs[$this->data_mesg_info[$global_mesg_num]['mesg_name']][$this->data_mesg_info[$global_mesg_num]['field_defns'][$field_defn['field_definition_number']]['field_name']][] = $tmp_array;
                                             } else {
-                                                $this->data_mesgs[$this->data_mesg_info[$this->defn_mesgs[$local_mesg_type]['global_mesg_num']]['mesg_name']][$this->data_mesg_info[$this->defn_mesgs[$local_mesg_type]['global_mesg_num']]['field_defns'][$field_defn['field_definition_number']]['field_name']][] = $tmp_value / $this->data_mesg_info[$this->defn_mesgs[$local_mesg_type]['global_mesg_num']]['field_defns'][$field_defn['field_definition_number']]['scale'] - $this->data_mesg_info[$this->defn_mesgs[$local_mesg_type]['global_mesg_num']]['field_defns'][$field_defn['field_definition_number']]['offset'];
+                                                $this->data_mesgs[$this->data_mesg_info[$global_mesg_num]['mesg_name']][$this->data_mesg_info[$global_mesg_num]['field_defns'][$field_defn['field_definition_number']]['field_name']][] = $tmp_value / $this->data_mesg_info[$global_mesg_num]['field_defns'][$field_defn['field_definition_number']]['scale'] - $this->data_mesg_info[$this->defn_mesgs[$local_mesg_type]['global_mesg_num']]['field_defns'][$field_defn['field_definition_number']]['offset'];
                                             }
                                         }
                                     }
                                 } else {
-                                    $file_key = $this->data_mesg_info[$this->defn_mesgs[$local_mesg_type]['global_mesg_num']]['mesg_name'];
-                                    $field_key = [$this->data_mesg_info[$this->defn_mesgs[$local_mesg_type]['global_mesg_num']]['field_defns'][$field_defn['field_definition_number']]['field_name']];
+                                    $file_key = $this->data_mesg_info[$global_mesg_num]['mesg_name'];
+                                    $field_key = [$this->data_mesg_info[$global_mesg_num]['field_defns'][$field_defn['field_definition_number']]['field_name']];
                                     $always_process = [['avg_heart_rate'], ['max_heart_rate'], ['avg_power'], ['max_power'], ['normalized_power'], ['total_work'], ['total_cycles'], ['avg_cadence'], ['max_cadence'], ['avg_fractional_cadence'], ['max_fractional_cadence'], ['training_stress_score'], ['intensity_factor'], ['threshold_power'], ['time_in_hr_zone'], ['total_training_effect'], ['total_ascent'], ['total_descent']];
 
                                     if ($file_key === 'session' && in_array($field_key, $always_process, true)) {
-                                        $this->data_mesgs[$this->data_mesg_info[$this->defn_mesgs[$local_mesg_type]['global_mesg_num']]['mesg_name']][$this->data_mesg_info[$this->defn_mesgs[$local_mesg_type]['global_mesg_num']]['field_defns'][$field_defn['field_definition_number']]['field_name']][] = null;
+                                        $this->data_mesgs[$this->data_mesg_info[$global_mesg_num]['mesg_name']][$this->data_mesg_info[$global_mesg_num]['field_defns'][$field_defn['field_definition_number']]['field_name']][] = null;
                                     }
                                 }
                             }
