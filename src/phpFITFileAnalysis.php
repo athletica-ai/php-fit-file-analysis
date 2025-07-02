@@ -3186,7 +3186,13 @@ class phpFITFileAnalysis
         if (is_array($last_event_timestamp)) {
             $last_event_timestamp = $last_event_timestamp[0];
         }
-        $start_timestamp = $this->data_mesgs['hr']['timestamp'] - $last_event_timestamp / 1024.0;
+
+        if (is_array($this->data_mesgs['hr']['timestamp'])) {
+            $start_timestamp = $this->data_mesgs['hr']['timestamp'][0] - $last_event_timestamp / 1024.0;
+        } else {
+            $start_timestamp = $this->data_mesgs['hr']['timestamp'] - $last_event_timestamp / 1024.0;
+        }
+
         $timestamps[] = $last_event_timestamp / 1024.0;
 
         // Determine timestamps (similar to compressed timestamps)
