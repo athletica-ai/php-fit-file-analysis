@@ -3238,8 +3238,18 @@ class phpFITFileAnalysis
             }
         }
 
+        if (count($filtered_bpm_arr) > 0) {
+            if (!is_array($this->data_mesgs['record']['heart_rate'])) {
+                throw new \UnexpectedValueException('Expected heart_rate to be an array, got ' . gettype($this->data_mesgs['record']['heart_rate']));
+            }
+        }
+
         // Populate the heart_rate fields for record messages
         foreach ($filtered_bpm_arr as $idx => $arr) {
+            if (!is_array($arr) || count($arr) < 2) {
+                throw new \UnexpectedValueException("Expected [value, divisor] array at index {$idx}");
+            }
+
             $this->data_mesgs['record']['heart_rate'][$idx] = (int)round($arr[0] / $arr[1]);
         }
     }
