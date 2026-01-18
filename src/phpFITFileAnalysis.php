@@ -656,6 +656,7 @@ class phpFITFileAnalysis
             67 => 'Meditation',
             76 => 'Water tubing',
             77 => 'Wakesurfing',
+            84 => 'Jump rope',
             254 => 'All'
         ],
         'sub_sport' => [  // Have capitalised and replaced underscores with spaces.
