@@ -3406,8 +3406,15 @@ class phpFITFileAnalysis
         }
 
         if (count($filtered_bpm_arr) > 0) {
-            if (!is_array($this->data_mesgs['record']['heart_rate'])) {
-                throw new \UnexpectedValueException('Expected heart_rate to be an array, got ' . gettype($this->data_mesgs['record']['heart_rate']));
+            // Heart rate can be delivered solely via `hr` messages (the separate
+            // uncompressed-HR stream used by many chest-strap / ANT+ sensors). In that
+            // case the `record` messages carry no heart_rate field yet, so initialise it
+            // before mapping the decoded values onto the record timestamps below.
+            if (!isset($this->data_mesgs['record']['heart_rate'])) {
+                $this->data_mesgs['record']['heart_rate'] = [];
+            } elseif (!is_array($this->data_mesgs['record']['heart_rate'])) {
+                // A single record message stores heart_rate as a scalar; normalise to an array.
+                $this->data_mesgs['record']['heart_rate'] = [$this->data_mesgs['record']['heart_rate']];
             }
         }
 
