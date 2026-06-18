@@ -3389,8 +3389,11 @@ class phpFITFileAnalysis
         // Map HR values to timestamps
         $filtered_bpm_arr = [];
         $secs = 0;
-        $min_record_ts = min($this->data_mesgs['record']['timestamp']);
-        $max_record_ts = max($this->data_mesgs['record']['timestamp']);
+        $record_timestamps = is_array($this->data_mesgs['record']['timestamp'])
+            ? $this->data_mesgs['record']['timestamp']
+            : [$this->data_mesgs['record']['timestamp']];
+        $min_record_ts = min($record_timestamps);
+        $max_record_ts = max($record_timestamps);
         foreach ($timestamps as $idx => $timestamp) {
             $ts_secs = round($timestamp + $start_timestamp);
 
