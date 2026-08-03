@@ -206,6 +206,13 @@ class phpFITFileAnalysis
             20 => 'activity_summary',
             28 => 'monitoring_daily',
             32 => 'monitoring_b',
+            // APP-1344: the table stopped at 32, so these three standard FIT file types came back
+            // as 'unknown' and a diagnostic over Athletica's parked-orphan directory could not say
+            // what the files were. Purely additive -- nothing in the library or in Athletica
+            // branches on these names; enumData() simply stops answering 'unknown' for them.
+            34 => 'segment',
+            35 => 'segment_list',
+            40 => 'exd_configuration',
             0xF7 => 'mfg_range_min',
             0xFE => 'mfg_range_max'
         ],
