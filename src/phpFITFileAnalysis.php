@@ -1851,15 +1851,9 @@ class phpFITFileAnalysis
 
                         // Process the temporary array and load values into the public data messages array
                         if (!empty($tmp_record_array)) {
-                            // APP-1554: was max($this->data_mesgs['record']['timestamp']) + 1, a full
-                            // scan of every timestamp read so far, executed once per record. That made
-                            // parsing quadratic in record count: 8.5k samples 0.3s, 62.6k 11.1s, 142.7k
-                            // 58.8s, with per-iteration cost rising 23x from the first 20k records to
-                            // the last. It is also dead work in the common case -- this value is only a
-                            // default, and is overwritten immediately below by the compressed-timestamp
-                            // branch or by the record's own timestamp field. A running maximum is exactly
-                            // equivalent (the array is appended to at one place only, further down this
-                            // same block) and O(1).
+                            // APP-1554: was max($this->data_mesgs['record']['timestamp']) + 1 -- an
+                            // O(n) scan per record, so O(n^2) per parse. The running maximum is
+                            // equivalent because the array is appended at one place only, just below.
                             $timestamp = $max_record_timestamp !== null ? $max_record_timestamp + 1 : 0;
                             if ($compressedTimestamp) {
                                 if ($previousTS === 0) {
