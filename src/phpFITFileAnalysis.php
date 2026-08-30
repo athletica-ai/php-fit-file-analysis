@@ -1622,6 +1622,9 @@ class phpFITFileAnalysis
         $developer_data_flag = 0;
         $local_mesg_type = 0;
         $previousTS = 0;
+        // APP-1554: running maximum of record timestamps, maintained instead of
+        // rescanning the accumulated array on every record. See the fallback below.
+        $max_record_timestamp = null;
 
         while ($this->file_header['header_size'] + $this->file_header['data_size'] > $this->file_pointer) {
             $record_header_byte = ord(substr($this->file_contents, $this->file_pointer, 1));
@@ -1848,7 +1851,16 @@ class phpFITFileAnalysis
 
                         // Process the temporary array and load values into the public data messages array
                         if (!empty($tmp_record_array)) {
-                            $timestamp = isset($this->data_mesgs['record']['timestamp']) ? max($this->data_mesgs['record']['timestamp']) + 1 : 0;
+                            // APP-1554: was max($this->data_mesgs['record']['timestamp']) + 1, a full
+                            // scan of every timestamp read so far, executed once per record. That made
+                            // parsing quadratic in record count: 8.5k samples 0.3s, 62.6k 11.1s, 142.7k
+                            // 58.8s, with per-iteration cost rising 23x from the first 20k records to
+                            // the last. It is also dead work in the common case -- this value is only a
+                            // default, and is overwritten immediately below by the compressed-timestamp
+                            // branch or by the record's own timestamp field. A running maximum is exactly
+                            // equivalent (the array is appended to at one place only, further down this
+                            // same block) and O(1).
+                            $timestamp = $max_record_timestamp !== null ? $max_record_timestamp + 1 : 0;
                             if ($compressedTimestamp) {
                                 if ($previousTS === 0) {
                                     // This should not happen! Throw exception?
@@ -1876,6 +1888,11 @@ class phpFITFileAnalysis
                             }
 
                             $this->data_mesgs['record']['timestamp'][] = $timestamp;
+                            // Timestamps are not guaranteed monotonic (see OutOfOrderTimestampsError),
+                            // so track the maximum rather than assuming the last append is the largest.
+                            if ($max_record_timestamp === null || $timestamp > $max_record_timestamp) {
+                                $max_record_timestamp = $timestamp;
+                            }
 
                             foreach ($tmp_record_array as $key => $value) {
                                 if ($value !== null) {
