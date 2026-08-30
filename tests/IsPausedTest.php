@@ -4,13 +4,13 @@ if(!class_exists('adriangibbons\phpFITFileAnalysis')) {
     require __DIR__ . '/../src/phpFITFileAnalysis.php';
 }
 
-class IsPausedTest extends PHPUnit_Framework_TestCase
+class IsPausedTest extends \PHPUnit\Framework\TestCase
 {
     private $base_dir;
     private $filename = 'power-analysis.fit';
     private $pFFA;
     
-    public function setUp()
+    protected function setUp(): void
     {
         $this->base_dir = __DIR__ . '/../demo/fit_files/';
         $this->pFFA = new adriangibbons\phpFITFileAnalysis($this->base_dir . $this->filename, ['units' => 'raw']);

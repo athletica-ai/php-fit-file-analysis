@@ -4,12 +4,12 @@ if(!class_exists('adriangibbons\phpFITFileAnalysis')) {
     require __DIR__ . '/../src/phpFITFileAnalysis.php';
 }
 
-class SetUnitsTest extends PHPUnit_Framework_TestCase
+class SetUnitsTest extends \PHPUnit\Framework\TestCase
 {
     private $base_dir;
     private $filename = 'road-cycling.fit';
     
-    public function setUp()
+    protected function setUp(): void
     {
         $this->base_dir = __DIR__ . '/../demo/fit_files/';
     }
@@ -32,11 +32,9 @@ class SetUnitsTest extends PHPUnit_Framework_TestCase
         }
     }
     
-    /**
-     * @expectedException Exception
-     */
     public function testSetUnits_validate_options_fail()
     {
+        $this->expectException(\Exception::class);
         $pFFA = new adriangibbons\phpFITFileAnalysis($this->base_dir . $this->filename, ['units' => 'INVALID']);
     }
     
@@ -50,11 +48,9 @@ class SetUnitsTest extends PHPUnit_Framework_TestCase
         }
     }
     
-    /**
-     * @expectedException Exception
-     */
     public function testSetUnits_validate_pace_option_fail()
     {
+        $this->expectException(\Exception::class);
         $pFFA = new adriangibbons\phpFITFileAnalysis($this->base_dir . $this->filename, ['pace' => 'INVALID']);
     }
 }

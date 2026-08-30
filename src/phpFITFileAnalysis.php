@@ -2899,7 +2899,10 @@ class phpFITFileAnalysis
 
                 $averages = ($this->php_trader_ext_loaded) ? trader_sma($this->data_mesgs['record']['power'], $time_period) : $this->sma($this->data_mesgs['record']['power'], $time_period);
                 if ($averages !== false) {
-                    $criticalPower_values[$time_period] = max($averages);
+                    // sma() is a generator; trader_sma() returns an array. PHP 8 rejects a
+                    // Generator in max(), so normalise. Pre-existing, surfaced by PowerTest
+                    // once the suite could run again (APP-1554).
+                    $criticalPower_values[$time_period] = max(is_array($averages) ? $averages : iterator_to_array($averages));
                 }
             }
 
@@ -2910,7 +2913,7 @@ class phpFITFileAnalysis
             } else {
                 $averages = ($this->php_trader_ext_loaded) ? trader_sma($this->data_mesgs['record']['power'], $time_periods) : $this->sma($this->data_mesgs['record']['power'], $time_periods);
                 if ($averages !== false) {
-                    $criticalPower_values[$time_periods] = max($averages);
+                    $criticalPower_values[$time_periods] = max(is_array($averages) ? $averages : iterator_to_array($averages));
                 }
             }
 
@@ -3241,7 +3244,10 @@ class phpFITFileAnalysis
 
             foreach ($this->data_mesgs['record'] as $key => $value) {
                 if ($key !== 'timestamp') {
-                    if ($$key) {
+                    // Variable variable: only the keys named in $data_required have a matching
+                    // local. 'timestamp_original' does not, which raised "Undefined variable"
+                    // once per record under PHP 8. Pre-existing (APP-1554).
+                    if (isset($$key) && $$key) {
                         $tmp[$key] = isset($value[$ts]) ? $value[$ts] : null;
                     }
                 }
