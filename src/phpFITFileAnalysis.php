@@ -1622,6 +1622,9 @@ class phpFITFileAnalysis
         $developer_data_flag = 0;
         $local_mesg_type = 0;
         $previousTS = 0;
+        // APP-1554: running maximum of record timestamps, maintained instead of
+        // rescanning the accumulated array on every record. See the fallback below.
+        $max_record_timestamp = null;
 
         while ($this->file_header['header_size'] + $this->file_header['data_size'] > $this->file_pointer) {
             $record_header_byte = ord(substr($this->file_contents, $this->file_pointer, 1));
@@ -1848,7 +1851,10 @@ class phpFITFileAnalysis
 
                         // Process the temporary array and load values into the public data messages array
                         if (!empty($tmp_record_array)) {
-                            $timestamp = isset($this->data_mesgs['record']['timestamp']) ? max($this->data_mesgs['record']['timestamp']) + 1 : 0;
+                            // APP-1554: was max($this->data_mesgs['record']['timestamp']) + 1 -- an
+                            // O(n) scan per record, so O(n^2) per parse. The running maximum is
+                            // equivalent because the array is appended at one place only, just below.
+                            $timestamp = $max_record_timestamp !== null ? $max_record_timestamp + 1 : 0;
                             if ($compressedTimestamp) {
                                 if ($previousTS === 0) {
                                     // This should not happen! Throw exception?
@@ -1876,6 +1882,11 @@ class phpFITFileAnalysis
                             }
 
                             $this->data_mesgs['record']['timestamp'][] = $timestamp;
+                            // Timestamps are not guaranteed monotonic (see OutOfOrderTimestampsError),
+                            // so track the maximum rather than assuming the last append is the largest.
+                            if ($max_record_timestamp === null || $timestamp > $max_record_timestamp) {
+                                $max_record_timestamp = $timestamp;
+                            }
 
                             foreach ($tmp_record_array as $key => $value) {
                                 if ($value !== null) {
@@ -2212,31 +2223,57 @@ class phpFITFileAnalysis
     {
         $gap_threshold_seconds = 60;
         $i = 0;
+
+        // APP-1554: a set keyed by timestamp, not a list. This was in_array() over a list that grew
+        // to one entry per second of the activity, scanned once per record -- O(n^2).
         $checked_timestamps = [];
 
+        // APP-1554: isPaused() emits one entry per second from the first record timestamp to the
+        // last, so the keys are contiguous ascending integers and ordinal position maps directly to
+        // key. That lets the per-record `array_search(false, array_slice($paused_timestamps, $i))`
+        // -- which copied the remainder of the array every time -- collapse into one backward pass
+        // recording, for each position, the first entry at or after it that is not paused.
+        //
+        // Safe against the mutation below: that only clears entries in [timestamp, unpaused_at),
+        // every one of which is marked checked and therefore skipped, so no position this table is
+        // later consulted for can have had its answer changed.
+        $keys = array_keys($paused_timestamps);
+        $next_unpaused_at = [];
+        $next = false;  // array_search() returned false when nothing later is unpaused
+        for ($p = count($keys) - 1; $p >= 0; --$p) {
+            if (!$paused_timestamps[$keys[$p]]) {
+                $next = $keys[$p];
+            }
+            $next_unpaused_at[$p] = $next;
+        }
+
         foreach ($paused_timestamps as $timestamp => $is_paused) {
-            if (in_array($timestamp, $checked_timestamps, true)) {
+            if (isset($checked_timestamps[$timestamp])) {
                 ++$i;
                 continue;
             }
 
             if (!$is_paused) {
-                $checked_timestamps[] = $timestamp;
+                $checked_timestamps[$timestamp] = true;
                 ++$i;
 
                 continue;
             }
 
             // look ahead to when was unpaused at
-            $unpaused_at = array_search(false, array_slice($paused_timestamps, $i, null, true));
+            $unpaused_at = $next_unpaused_at[$i];
 
             if ($unpaused_at - $timestamp <= $gap_threshold_seconds) {
                 for ($x = $timestamp; $x < $unpaused_at; ++$x) {
                     $paused_timestamps[$x] = false;
-                    $checked_timestamps[] = $x;
+                    $checked_timestamps[$x] = true;
                 }
             } else {
-                $checked_timestamps = array_merge($checked_timestamps, range($timestamp, $unpaused_at));
+                // range() rather than a loop, to keep its exact semantics for the degenerate
+                // bounds the original could produce.
+                foreach (range($timestamp, $unpaused_at) as $x) {
+                    $checked_timestamps[$x] = true;
+                }
             }
 
             ++$i;
@@ -2862,7 +2899,10 @@ class phpFITFileAnalysis
 
                 $averages = ($this->php_trader_ext_loaded) ? trader_sma($this->data_mesgs['record']['power'], $time_period) : $this->sma($this->data_mesgs['record']['power'], $time_period);
                 if ($averages !== false) {
-                    $criticalPower_values[$time_period] = max($averages);
+                    // sma() is a generator; trader_sma() returns an array. PHP 8 rejects a
+                    // Generator in max(), so normalise. Pre-existing, surfaced by PowerTest
+                    // once the suite could run again (APP-1554).
+                    $criticalPower_values[$time_period] = max(is_array($averages) ? $averages : iterator_to_array($averages));
                 }
             }
 
@@ -2873,7 +2913,7 @@ class phpFITFileAnalysis
             } else {
                 $averages = ($this->php_trader_ext_loaded) ? trader_sma($this->data_mesgs['record']['power'], $time_periods) : $this->sma($this->data_mesgs['record']['power'], $time_periods);
                 if ($averages !== false) {
-                    $criticalPower_values[$time_periods] = max($averages);
+                    $criticalPower_values[$time_periods] = max(is_array($averages) ? $averages : iterator_to_array($averages));
                 }
             }
 
@@ -3204,7 +3244,10 @@ class phpFITFileAnalysis
 
             foreach ($this->data_mesgs['record'] as $key => $value) {
                 if ($key !== 'timestamp') {
-                    if ($$key) {
+                    // Variable variable: only the keys named in $data_required have a matching
+                    // local. 'timestamp_original' does not, which raised "Undefined variable"
+                    // once per record under PHP 8. Pre-existing (APP-1554).
+                    if (isset($$key) && $$key) {
                         $tmp[$key] = isset($value[$ts]) ? $value[$ts] : null;
                     }
                 }

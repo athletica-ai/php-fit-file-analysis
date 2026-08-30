@@ -4,13 +4,13 @@ if(!class_exists('adriangibbons\phpFITFileAnalysis')) {
     require __DIR__ . '/../src/phpFITFileAnalysis.php';
 }
 
-class FixDataTest extends PHPUnit_Framework_TestCase
+class FixDataTest extends \PHPUnit\Framework\TestCase
 {
     private $base_dir;
     private $filename = 'road-cycling.fit';
     private $filename2 = 'power-analysis.fit';
     
-    public function setUp()
+    protected function setUp(): void
     {
         $this->base_dir = __DIR__ . '/../demo/fit_files/';
     }
@@ -82,7 +82,10 @@ class FixDataTest extends PHPUnit_Framework_TestCase
     {
         $pFFA = new adriangibbons\phpFITFileAnalysis($this->base_dir . $this->filename, ['fix_data' => ['heart_rate']]);
         
-        $this->assertEquals(117.5, $pFFA->data_mesgs['record']['heart_rate'][1437052792]);
+        // 118, not 117.5: fixData() passes $is_int = true for heart_rate, so the interpolated
+        // value is rounded. A heart rate of 117.5 bpm is not a value the library intends to
+        // produce. The expectation predates that rounding (APP-1554).
+        $this->assertEquals(118, $pFFA->data_mesgs['record']['heart_rate'][1437052792]);
     }
     
     public function testFixData_validate_options_pass()
@@ -91,6 +94,9 @@ class FixDataTest extends PHPUnit_Framework_TestCase
         $valid_options = ['all', 'cadence', 'distance', 'heart_rate', 'lat_lon', 'speed', 'power'];
         foreach($valid_options as $valid_option) {
             $pFFA = new adriangibbons\phpFITFileAnalysis($this->base_dir . $this->filename, ['fix_data' => [$valid_option]]);
+            // The point of this test is that a valid option does not throw, but a test that
+            // asserts nothing is reported as risky and proves nothing on its own (APP-1554).
+            $this->assertNotEmpty($pFFA->data_mesgs['record']['timestamp'], $valid_option);
         }
     }
     
@@ -106,27 +112,21 @@ class FixDataTest extends PHPUnit_Framework_TestCase
         $this->assertEquals(6847, count($pFFA->data_mesgs['record']['speed']));
     }
     
-    /**
-     * @expectedException Exception
-     */
     public function testFixData_validate_options_fail()
     {
+        $this->expectException(\Exception::class);
         $pFFA = new adriangibbons\phpFITFileAnalysis($this->base_dir . $this->filename, ['fix_data' => ['INVALID']]);
     }
     
-    /**
-     * @expectedException Exception
-     */
     public function testFixData_invalid_pace_option()
     {
+        $this->expectException(\Exception::class);
         $pFFA = new adriangibbons\phpFITFileAnalysis($this->base_dir . $this->filename, ['pace' => 'INVALID']);
     }
     
-    /**
-     * @expectedException Exception
-     */
     public function testFixData_invalid_pace_option2()
     {
+        $this->expectException(\Exception::class);
         $pFFA = new adriangibbons\phpFITFileAnalysis($this->base_dir . $this->filename, ['pace' => 123456]);
     }
 }

@@ -47,3 +47,15 @@ Network Trash Folder
 Temporary Items
 .apdisk
 /nbproject
+
+# PHPUnit
+/.phpunit.cache/
+/vendor/
+/composer.lock
+
+# IDE
+/.idea/
+
+# Local scratch
+/docs/
+/src/_*.php

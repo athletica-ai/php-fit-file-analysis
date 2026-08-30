@@ -4,13 +4,13 @@ if(!class_exists('adriangibbons\phpFITFileAnalysis')) {
     require __DIR__ . '/../src/phpFITFileAnalysis.php';
 }
 
-class EnumDataTest extends PHPUnit_Framework_TestCase
+class EnumDataTest extends \PHPUnit\Framework\TestCase
 {
     private $base_dir;
     private $filename = 'swim.fit';
     private $pFFA;
     
-    public function setUp()
+    protected function setUp(): void
     {
         $this->base_dir = __DIR__ . '/../demo/fit_files/';
         $this->pFFA = new adriangibbons\phpFITFileAnalysis($this->base_dir . $this->filename, ['units' => 'raw']);
