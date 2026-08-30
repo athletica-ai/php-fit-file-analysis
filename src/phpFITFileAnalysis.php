@@ -2223,31 +2223,57 @@ class phpFITFileAnalysis
     {
         $gap_threshold_seconds = 60;
         $i = 0;
+
+        // APP-1554: a set keyed by timestamp, not a list. This was in_array() over a list that grew
+        // to one entry per second of the activity, scanned once per record -- O(n^2).
         $checked_timestamps = [];
 
+        // APP-1554: isPaused() emits one entry per second from the first record timestamp to the
+        // last, so the keys are contiguous ascending integers and ordinal position maps directly to
+        // key. That lets the per-record `array_search(false, array_slice($paused_timestamps, $i))`
+        // -- which copied the remainder of the array every time -- collapse into one backward pass
+        // recording, for each position, the first entry at or after it that is not paused.
+        //
+        // Safe against the mutation below: that only clears entries in [timestamp, unpaused_at),
+        // every one of which is marked checked and therefore skipped, so no position this table is
+        // later consulted for can have had its answer changed.
+        $keys = array_keys($paused_timestamps);
+        $next_unpaused_at = [];
+        $next = false;  // array_search() returned false when nothing later is unpaused
+        for ($p = count($keys) - 1; $p >= 0; --$p) {
+            if (!$paused_timestamps[$keys[$p]]) {
+                $next = $keys[$p];
+            }
+            $next_unpaused_at[$p] = $next;
+        }
+
         foreach ($paused_timestamps as $timestamp => $is_paused) {
-            if (in_array($timestamp, $checked_timestamps, true)) {
+            if (isset($checked_timestamps[$timestamp])) {
                 ++$i;
                 continue;
             }
 
             if (!$is_paused) {
-                $checked_timestamps[] = $timestamp;
+                $checked_timestamps[$timestamp] = true;
                 ++$i;
 
                 continue;
             }
 
             // look ahead to when was unpaused at
-            $unpaused_at = array_search(false, array_slice($paused_timestamps, $i, null, true));
+            $unpaused_at = $next_unpaused_at[$i];
 
             if ($unpaused_at - $timestamp <= $gap_threshold_seconds) {
                 for ($x = $timestamp; $x < $unpaused_at; ++$x) {
                     $paused_timestamps[$x] = false;
-                    $checked_timestamps[] = $x;
+                    $checked_timestamps[$x] = true;
                 }
             } else {
-                $checked_timestamps = array_merge($checked_timestamps, range($timestamp, $unpaused_at));
+                // range() rather than a loop, to keep its exact semantics for the degenerate
+                // bounds the original could produce.
+                foreach (range($timestamp, $unpaused_at) as $x) {
+                    $checked_timestamps[$x] = true;
+                }
             }
 
             ++$i;
