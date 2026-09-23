@@ -1213,6 +1213,8 @@ class phpFITFileAnalysis
                 107 => ['field_name' => 'max_power_position',            'scale' => 1,         'offset' => 0, 'units' => 'watts'],
                 108 => ['field_name' => 'avg_cadence_position',          'scale' => 1,         'offset' => 0, 'units' => 'rpm'],
                 109 => ['field_name' => 'max_cadence_position',          'scale' => 1,         'offset' => 0, 'units' => 'rpm'],
+                110 => ['field_name' => 'enhanced_avg_speed',             'scale' => 1000,      'offset' => 0, 'units' => 'm/s'],
+                111 => ['field_name' => 'enhanced_max_speed',             'scale' => 1000,      'offset' => 0, 'units' => 'm/s'],
                 253 => ['field_name' => 'timestamp',                     'scale' => 1,         'offset' => 0, 'units' => 's'],
                 254 => ['field_name' => 'message_index',                 'scale' => 1,         'offset' => 0, 'units' => '']
             ]
@@ -1625,6 +1627,9 @@ class phpFITFileAnalysis
         // APP-1554: running maximum of record timestamps, maintained instead of
         // rescanning the accumulated array on every record. See the fallback below.
         $max_record_timestamp = null;
+        // APP-1788: lap messages read so far, and each lap field's length before the current one.
+        $lap_count = 0;
+        $lap_field_counts = [];
 
         while ($this->file_header['header_size'] + $this->file_header['data_size'] > $this->file_pointer) {
             $record_header_byte = ord(substr($this->file_contents, $this->file_pointer, 1));
@@ -1722,6 +1727,10 @@ class phpFITFileAnalysis
                 case DATA_MESSAGE:
                     // Check that we have information on the Data Message.
                     if (isset($this->data_mesg_info[$this->defn_mesgs[$local_mesg_type]['global_mesg_num']])) {
+                        $is_lap_mesg = $this->defn_mesgs[$local_mesg_type]['global_mesg_num'] === 19;
+                        if ($is_lap_mesg) {
+                            $lap_field_counts = array_map('count', $this->data_mesgs['lap'] ?? []);
+                        }
                         $tmp_record_array = [];  // Temporary array to store Record data message pieces
                         $tmp_value = null;  // Placeholder for value for checking before inserting into the tmp_record_array
 
@@ -1894,6 +1903,10 @@ class phpFITFileAnalysis
                                 }
                             }
                         }
+
+                        if ($is_lap_mesg) {
+                            $this->padLapFields(++$lap_count, $lap_field_counts);
+                        }
                     } else {
                         $this->file_pointer += $this->defn_mesgs[$local_mesg_type]['total_size'];
                     }
@@ -1915,6 +1928,32 @@ class phpFITFileAnalysis
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /**
+     * APP-1788: keep every lap field one entry per lap message, so index $i is lap $i in all of them.
+     *
+     * readDataRecords() appends a lap field only when that lap carries a valid value for it, so a
+     * field that is invalid (an HR strap dropping out) or absent (power only on a triathlon's bike
+     * leg) would otherwise leave its list shorter than the lap count, with every later value shifted
+     * onto the wrong lap. Called after each lap message: a field this lap did not write gets null,
+     * and a field first seen on this lap gets null for every earlier lap.
+     *
+     * @param int   $lap_count     laps read so far, including this one
+     * @param array $counts_before each lap field's length before this lap was read
+     */
+    private function padLapFields($lap_count, array $counts_before)
+    {
+        foreach ($this->data_mesgs['lap'] ?? [] as $field => $values) {
+            // Written in place, so a field this lap already filled is not copied (see APP-1554).
+            $before = $counts_before[$field] ?? 0;
+            if ($before < $lap_count - 1) {
+                $this->data_mesgs['lap'][$field] = array_merge(array_fill(0, $lap_count - 1 - $before, null), $values);
+            }
+            if (count($this->data_mesgs['lap'][$field]) < $lap_count) {
+                $this->data_mesgs['lap'][$field][] = null;
             }
         }
     }
@@ -1953,7 +1992,10 @@ class phpFITFileAnalysis
                 if (isset($this->data_mesgs[$date_time['message_name']][$date_time['field_name']])) {
                     if (is_array($this->data_mesgs[$date_time['message_name']][$date_time['field_name']])) {
                         foreach ($this->data_mesgs[$date_time['message_name']][$date_time['field_name']] as &$element) {
-                            $element += FIT_UNIX_TS_DIFF;
+                            // APP-1788: lap fields hold null for a lap without a valid value.
+                            if ($element !== null) {
+                                $element += FIT_UNIX_TS_DIFF;
+                            }
                         }
                     } else {
                         $this->data_mesgs[$date_time['message_name']][$date_time['field_name']] += FIT_UNIX_TS_DIFF;
@@ -2505,6 +2547,9 @@ class phpFITFileAnalysis
                         if (isset($this->data_mesgs[$message][$field])) {
                             if (is_array($this->data_mesgs[$message][$field])) {
                                 foreach ($this->data_mesgs[$message][$field] as &$value) {
+                                    if ($value === null) {  // APP-1788: a lap without a valid value
+                                        continue;
+                                    }
                                     $value = round((($value * 9) / 5) + 32, 2);
                                 }
                             } else {
@@ -2518,6 +2563,9 @@ class phpFITFileAnalysis
                         if (isset($this->data_mesgs[$message][$field])) {
                             if (is_array($this->data_mesgs[$message][$field])) {
                                 foreach ($this->data_mesgs[$message][$field] as &$value) {
+                                    if ($value === null) {  // APP-1788: a lap without a valid value
+                                        continue;
+                                    }
                                     $value = round($value * 0.000621371192, 2);
                                 }
                             } else {
@@ -2531,6 +2579,9 @@ class phpFITFileAnalysis
                         if (isset($this->data_mesgs[$message][$field])) {
                             if (is_array($this->data_mesgs[$message][$field])) {
                                 foreach ($this->data_mesgs[$message][$field] as &$value) {
+                                    if ($value === null) {  // APP-1788: a lap without a valid value
+                                        continue;
+                                    }
                                     $value = round($value * 3.2808399, 1);
                                 }
                             } else {
@@ -2544,6 +2595,9 @@ class phpFITFileAnalysis
                         if (isset($this->data_mesgs[$message][$field])) {
                             if (is_array($this->data_mesgs[$message][$field])) {
                                 foreach ($this->data_mesgs[$message][$field] as &$value) {
+                                    if ($value === null) {  // APP-1788: a lap without a valid value
+                                        continue;
+                                    }
                                     if ($bPace) {
                                         $value = round(60 / 2.23693629 / $value, 3);
                                     } else {
@@ -2565,6 +2619,9 @@ class phpFITFileAnalysis
                         if (isset($this->data_mesgs[$message][$field])) {
                             if (is_array($this->data_mesgs[$message][$field])) {
                                 foreach ($this->data_mesgs[$message][$field] as &$value) {
+                                    if ($value === null) {  // APP-1788: a lap without a valid value
+                                        continue;
+                                    }
                                     $value = round($value * (180.0 / pow(2, 31)), 5);
                                 }
                             } else {
@@ -2584,6 +2641,9 @@ class phpFITFileAnalysis
                         if (isset($this->data_mesgs[$message][$field])) {
                             if (is_array($this->data_mesgs[$message][$field])) {
                                 foreach ($this->data_mesgs[$message][$field] as &$value) {
+                                    if ($value === null) {  // APP-1788: a lap without a valid value
+                                        continue;
+                                    }
                                     $value = round($value * 0.001, 2);
                                 }
                             } else {
@@ -2597,6 +2657,9 @@ class phpFITFileAnalysis
                         if (isset($this->data_mesgs[$message][$field])) {
                             if (is_array($this->data_mesgs[$message][$field])) {
                                 foreach ($this->data_mesgs[$message][$field] as &$value) {
+                                    if ($value === null) {  // APP-1788: a lap without a valid value
+                                        continue;
+                                    }
                                     if ($bPace) {
                                         $value = ($value != 0) ? round(60 / 3.6 / $value, 3) : 0;
                                     } else {
@@ -2621,6 +2684,9 @@ class phpFITFileAnalysis
                         if (isset($this->data_mesgs[$message][$field])) {
                             if (is_array($this->data_mesgs[$message][$field])) {
                                 foreach ($this->data_mesgs[$message][$field] as &$value) {
+                                    if ($value === null) {  // APP-1788: a lap without a valid value
+                                        continue;
+                                    }
                                     $value = round($value * (180.0 / pow(2, 31)), 5);
                                 }
                             } else {
