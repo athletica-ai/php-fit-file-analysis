@@ -313,6 +313,48 @@ class DeveloperFieldOverrideTest extends \PHPUnit\Framework\TestCase
         $this->assertSame(200, $this->parseBytes($bytes)->data_mesgs['record']['power'][$this->ts(0)]);
     }
 
+    /**
+     * Review finding on #9: the per-record replace-a-0 rule mixed two declarers in one session. Stryd
+     * (declared first) stands still at 0 for ten records while another app writes 250 throughout;
+     * the session takes Stryd's values only.
+     */
+    public function testOneDeclarerSuppliesTheWholeSession()
+    {
+        $bytes = $this->developerDataId()
+            . $this->powerDescription(0, 0, self::UINT16) . $this->powerDescription(4, 1, self::UINT16, "other power\0")
+            . $this->definition(1, self::RECORD, [[253, 4, self::UINT32], [7, 2, self::UINT16]], [[0, 2, 0], [1, 2, 0]]);
+        for ($i = 0; $i < 40; $i++) {
+            $bytes .= $this->data(1, pack('Vvvv', 1000 + $i, 300, $i < 10 ? 0 : 200, 250));
+        }
+
+        $power = $this->parseBytes($bytes)->data_mesgs['record']['power'];
+
+        $this->assertSame(0, $power[$this->ts(0)], 'Stryd standing still, not the other app');
+        $this->assertSame(200, $power[$this->ts(10)]);
+    }
+
+    /**
+     * Review finding on #9: with Stryd's description after its records, the replayed values arrived
+     * after another declarer's and lost to them. The choice is by declaration, not arrival.
+     */
+    public function testTheChoiceDoesNotDependOnWhereADescriptionSits()
+    {
+        $bytes = $this->developerDataId()
+            . $this->powerDescription(4, 1, self::UINT16, "other power\0")
+            . $this->definition(1, self::RECORD, [[253, 4, self::UINT32], [7, 2, self::UINT16]], [[0, 2, 0], [1, 2, 0]]);
+        for ($i = 0; $i < 40; $i++) {
+            $bytes .= $this->data(1, pack('Vvvv', 1000 + $i, 300, 200, 250));
+            if ($i === 19) {
+                $bytes .= $this->powerDescription(0, 0, self::UINT16);
+            }
+        }
+
+        $power = $this->parseBytes($bytes)->data_mesgs['record']['power'];
+
+        $this->assertSame(200, $power[$this->ts(0)], 'replayed before its description, still the first declarer');
+        $this->assertSame(200, $power[$this->ts(39)]);
+    }
+
     /** Zeros inside a session that has Stryd readings (standing still) are Stryd's, not the watch's. */
     public function testZerosBesideStrydReadingsAreKept()
     {
