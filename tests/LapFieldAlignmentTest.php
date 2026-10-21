@@ -3,6 +3,7 @@ error_reporting(E_ALL);
 if(!class_exists('adriangibbons\phpFITFileAnalysis')) {
     require __DIR__ . '/../src/phpFITFileAnalysis.php';
 }
+require_once __DIR__ . '/FitFileBuilder.php';
 
 /**
  * APP-1788: every lap field holds one entry per lap message, so index $i is lap $i in all of them.
@@ -12,6 +13,8 @@ if(!class_exists('adriangibbons\phpFITFileAnalysis')) {
  */
 class LapFieldAlignmentTest extends \PHPUnit\Framework\TestCase
 {
+    use FitFileBuilder;
+
     private const LAP = 19;
     private const UINT8 = 0x02;
     private const UINT16 = 0x84;
@@ -82,23 +85,4 @@ class LapFieldAlignmentTest extends \PHPUnit\Framework\TestCase
         $this->assertEqualsWithDelta(60 / 2.23693629 / 3.5, $pFFA->data_mesgs['lap']['enhanced_avg_speed'][2], 0.001);
     }
 
-    private function definition($localType, $globalMesgNum, array $fields)
-    {
-        $bytes = pack('CCCvC', 0x40 | $localType, 0, 0, $globalMesgNum, count($fields));
-        foreach ($fields as [$number, $size, $baseType]) {
-            $bytes .= pack('CCC', $number, $size, $baseType);
-        }
-
-        return $bytes;
-    }
-
-    private function data($localType, $payload)
-    {
-        return pack('C', $localType) . $payload;
-    }
-
-    private function fitFile($records)
-    {
-        return pack('CCvV', 14, 16, 2132, strlen($records)) . '.FIT' . pack('v', 0) . $records . pack('v', 0);
-    }
 }

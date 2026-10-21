@@ -1,7 +1,9 @@
 [![Build Status](https://travis-ci.org/adriangibbons/php-fit-file-analysis.svg?branch=master)](https://travis-ci.org/adriangibbons/php-fit-file-analysis) [![Packagist](https://img.shields.io/packagist/v/adriangibbons/php-fit-file-analysis.svg)](https://packagist.org/packages/adriangibbons/php-fit-file-analysis) [![Packagist](https://img.shields.io/packagist/dt/adriangibbons/php-fit-file-analysis.svg)](https://packagist.org/packages/adriangibbons/php-fit-file-analysis) [![Coverage Status](https://coveralls.io/repos/adriangibbons/php-fit-file-analysis/badge.svg?branch=master&service=github)](https://coveralls.io/github/adriangibbons/php-fit-file-analysis?branch=master)
 # phpFITFileAnalysis
 
-A PHP (>= v5.4) class for analysing FIT files created by Garmin GPS devices.
+A PHP (>= 8.3) class for analysing FIT files created by Garmin GPS devices.
+
+Messages, fields, scales, units and enumerated types come from Garmin's official FIT SDK: `src/Profile.php` is generated from the SDK's profile (currently **21.218.0**, pinned in `bin/fit-sdk-version.txt`; `Profile::VERSION` at runtime). See [Keeping up with the FIT SDK](#keeping-up-with-the-fit-sdk).
 
 [Live demonstration](http://adriangibbons.com/php-fit-file-analysis/demo/) (Right-click and Open in new tab)
 
@@ -40,7 +42,7 @@ The composer.json file should autoload the ```phpFITFileAnalysis``` class, so as
 ?>
 ```
 
-**The more manual way:** Download the ZIP from GitHub and put PHP class file from the /src directory somewhere appropriate (e.g. classes/). A conscious effort has been made to keep everything in a single file.
+**The more manual way:** Download the ZIP from GitHub and put the files from the /src directory together somewhere appropriate (e.g. classes/). `phpFITFileAnalysis.php` loads the others (`Profile.php`, `FitParseException.php`, `FitBitStream.php`) from its own directory.
 
 Then include the file on the PHP page where you want to use it and instantiate an object of the class:
 ```php
@@ -79,9 +81,12 @@ foreach ($pFFA->data_mesgs as $mesg_key => $mesg) {  // Iterate the array and ou
     echo "<br>";
 }
 
-// Option 2. Show the debug information
+// Option 2. Get the debug information as an array (definitions found, messages decoded)...
+$info = $pFFA->debugInfo();
+// ...or show it as HTML tables
 $pFFA->showDebugInfo();  // Quite a lot of info...
 ```
+Every message and field in the FIT SDK profile is decoded. Fields that hold several values are arrays, and an invalid value is `null` (or, for a record, absent at that timestamp). Except for `record` (keyed by timestamp) and `hr`, every message's fields hold one entry per message, `null` where that message had no valid value, so index `$i` is the same lap, session, length, device, etc. in every field.
 **How about some real-world examples?**
 ```php
 // Get Max and Avg Speed
@@ -96,9 +101,7 @@ echo "var chartData = [";
 echo "];";
 ```
 **Enumerated Data**
-The FIT protocol makes use of enumerated data types. Where these values have been identified in the FIT SDK, they have been included in the class as a private variable: $enum_data.
-
-This library has no official FIT profile version of its own, so Garmin's [FIT SDK](https://developer.garmin.com/fit/) is the reference to check when adding or updating enumerated values. Garmin product IDs come from `garminProduct` in the SDK's [profile.js](https://github.com/garmin/fit-javascript-sdk/blob/main/src/profile.js), currently checked against v21.218.0.
+The FIT protocol makes use of enumerated data types. The names this library has always returned are in the class as a private variable, $enum_data; any other value is named from the FIT SDK profile, and any SDK type name can be used (e.g. `enumData('lap_trigger', 7)` returns 'session_end'). `'product'` is the SDK's `garmin_product`; `product()` uses it only for Garmin, Dynastream and Tacx devices.
 
 A public function is available, which will return the enumerated value for a given message type. For example:
 ```php
@@ -116,7 +119,7 @@ In addition, public functions provide a short-hand way to access commonly used e
  - sport()
 
 ### Optional Parameters
-There are five optional parameters that can be passed as an associative array when the phpFITFileAnalysis object is instantiated. These are:
+There are optional parameters that can be passed as an associative array when the phpFITFileAnalysis object is instantiated (see also 'expand_subfields', 'expand_components', 'validate_crc' and 'always_arrays' further down). These are:
 
  - fix_data
  - data_every_second
@@ -299,7 +302,23 @@ echo 'The difference (in seconds) between FIT and Unix timestamps is '. number_f
 By default, fields of type date_time and local_date_time read from FIT files will have this delta added to them so that they can be treated as Unix time. If the FIT timestamp is required, the 'garmin_timestamps' option can be set to true.
 
 #### Overwrite with Developer Data
-The FIT standard allows developers to define the meaning of data without requiring changes to the FIT profile being used. They may define data that is already incorporated in the standard - e.g. HR, cadence, power, etc. By default, if developers do this, the data will overwrite anything in the regular ```$pFFA->data_mesgs['record']``` array. If you do not want this occur, set the 'overwrite_with_dev_data' option to false. The data will still be available in ```$pFFA->data_mesgs['developer_data']```.
+The FIT standard allows developers to define the meaning of data without requiring changes to the FIT profile being used. They may define data that is already incorporated in the standard - e.g. HR, cadence, power, etc. By default, if developers do this, the data will overwrite anything in the regular ```$pFFA->data_mesgs['record']``` array. If you do not want this occur, set the 'overwrite_with_dev_data' option to false. The data will still be available in ```$pFFA->data_mesgs['developer_data']```: per field, `'units'`, `'data'` (every raw value in file order) and `'by_mesg'` (per message name, the values with the field's scale and offset applied, `null` when invalid; keyed by timestamp for records).
+
+#### Subfields and Components (FIT SDK decoding)
+As the FIT SDK's own decoders do:
+
+ - **'expand_subfields'** (default `true`): a field is also read under the name and type its reference field selects, e.g. a running session's `total_cycles` is also its `total_strides`, an event's `data` its `gear_change_data` or `timer_trigger`, a device's `product` its `garmin_product`.
+ - **'expand_components'** (default `false`): a field packing others is unpacked into them. `'enhanced'` expands only into `enhanced_*` fields, so `speed` also fills `enhanced_speed` and `altitude` `enhanced_altitude`; that is a second copy of each stream, which is why it is off by default. Current devices write only the enhanced fields and older ones only the others, so read `enhanced_speed` and fall back to `speed`. `true` expands every component (e.g. `compressed_speed_distance`, gears from event `data`, `cycles` into an accumulated `total_cycles`). A component never replaces a field the message carries itself.
+
+#### Other options
+ - **'validate_crc'** (default `false`): check the header and file CRCs and throw `adriangibbons\FitParseException` on a mismatch.
+ - **'always_arrays'** (default `false`): keep every field a list, even when it has one value. By default a field with a single value is that value (e.g. `session['avg_power']` is an int in a one-session file and an array in a two-session one).
+
+Text fields (names, product names, developer strings) are returned as written in the file, as UTF-8. They are not HTML-escaped (they once went through PHP's deprecated `FILTER_SANITIZE_STRING`), so escape them before putting them in a page: the file may come from anyone.
+
+Session `workout_feel` and `workout_rpe` are the FIT SDK values (e.g. 75, 70). They were once returned as `feel` and `rpe`, at a tenth of that.
+
+A file the library cannot read (bad header, truncated, a data message without a definition) throws `adriangibbons\FitParseException`, a `RuntimeException`. Chained FIT files (several FIT files concatenated) are read to the end.
 
 ## Analysis
 The following functions return arrays of data that could be used to create tables/charts:
@@ -373,13 +392,19 @@ Returns array of gear change information (if present, e.g. using Shimano D-Fly W
 array gearChanges($bIgnoreTimerPaused = true)
 ```
 
+The analysis methods count each sample as one second. For files recorded with smart recording (a sample every few seconds), pass `'data_every_second' => true` before using `hrMetrics()`, `powerMetrics()` or `criticalPower()`.
+
+## Keeping up with the FIT SDK
+Garmin's FIT SDK is the source of truth: <https://developer.garmin.com/fit/> and its profile, e.g. [fit-python-sdk `profile.py`](https://github.com/garmin/fit-python-sdk/blob/main/garmin_fit_sdk/profile.py) (the same profile as the JavaScript SDK's `profile.js`).
+
+ - `composer profile -- --version=X.Y.Z` regenerates `src/Profile.php` and `bin/fit-sdk-version.txt` for that SDK release (add `--summary=FILE` for a Markdown summary of what changed; `composer profile-check` fails if `src/Profile.php` is not what the pinned version generates, as CI checks).
+ - The **FIT SDK watch** workflow (`.github/workflows/fit-sdk-watch.yml`) compares the pinned version with Garmin's latest release every Monday and opens (or updates) one issue, labelled `fit-sdk`, with that summary. Review it, especially any changed scale, offset or units of a field you already store, then regenerate, run the tests and open a PR.
+ - Display names for new devices or sports can be added to `$enum_data`; without one, `enumData()` returns the SDK's name.
+
+## Development
+`composer test` (PHPUnit), `composer phpstan` (PHPStan, level 6). Tests build FIT files byte by byte with `tests/FitFileBuilder.php` rather than shipping recorded files, which carry athletes' GPS.
+
 ## Acknowledgement
-This class has been created using information available in a Software Development Kit (SDK) originally made available by ANT and now maintained by Garmin ([developer.garmin.com/fit](https://developer.garmin.com/fit/)).
+This class was originally created using information available in a Software Development Kit (SDK) made available by ANT ([thisisant.com](http://www.thisisant.com/resources/fit)); the FIT SDK is now published by Garmin at <https://developer.garmin.com/fit/>.
 
-As a minimum, I'd recommend reading the three PDFs included in the SDK:
-
- 1. FIT File Types Description
- 2. FIT SDK Introductory Guide
- 3. Flexible & Interoperable Data Transfer (FIT) Protocol
-
-Following these, the 'Profile.xls' spreadsheet and then the Java/C/C++ examples.
+As a minimum, I'd recommend reading the FIT Protocol and FIT File Types documentation there, then the SDK's profile and decoder source.

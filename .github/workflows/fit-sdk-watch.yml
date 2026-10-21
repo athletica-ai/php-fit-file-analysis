@@ -1,0 +1,79 @@
+name: FIT SDK watch
+
+# Garmin's FIT SDK is the source of truth for src/Profile.php (see bin/generate-profile.php).
+# Weekly, compare the version pinned in bin/fit-sdk-version.txt with Garmin's latest release and,
+# when they differ, open (or update) one issue with a summary of what the new profile changes.
+# It never opens a PR: a profile change can change values the app has already stored, so a person
+# regenerates, reviews and merges.
+
+on:
+  schedule:
+    - cron: '23 5 * * 1'  # Mondays
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          coverage: none
+
+      - name: Compare the pinned and latest SDK versions
+        id: versions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pinned="$(tr -d '[:space:]' < bin/fit-sdk-version.txt)"
+          latest="$(gh api repos/garmin/fit-python-sdk/releases/latest --jq .tag_name)"
+          # The tag comes from another repository: use it only if it is a plain version number.
+          if ! [[ "$latest" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Unexpected latest release tag: $latest" >&2
+            exit 1
+          fi
+          echo "pinned=$pinned" >> "$GITHUB_OUTPUT"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          echo "Pinned $pinned, latest $latest"
+
+      - name: Summarise the new profile
+        if: steps.versions.outputs.latest != steps.versions.outputs.pinned
+        env:
+          LATEST: ${{ steps.versions.outputs.latest }}
+        run: php bin/generate-profile.php --version="$LATEST" --summary=summary.md
+
+      - name: Open or update the issue
+        if: steps.versions.outputs.latest != steps.versions.outputs.pinned
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LATEST: ${{ steps.versions.outputs.latest }}
+          PINNED: ${{ steps.versions.outputs.pinned }}
+        run: |
+          {
+            echo "Garmin released FIT SDK **$LATEST**; this library is pinned to **$PINNED**."
+            echo
+            echo "To update:"
+            echo
+            echo '1. `php bin/generate-profile.php --version='"$LATEST"'` (rewrites `src/Profile.php` and `bin/fit-sdk-version.txt`)'
+            echo '2. Review the summary below. Under "Changed or removed", anything touching a field the app reads changes values it may already have stored.'
+            echo '3. Add display names for new devices or sports to `$enum_data` if wanted (others fall back to the SDK name).'
+            echo '4. `composer test`, then open a PR.'
+            echo
+            echo "Release: https://github.com/garmin/fit-python-sdk/releases/tag/$LATEST"
+            echo
+            cat summary.md
+          } > body.md
+          title="FIT SDK $LATEST released (pinned: $PINNED)"
+          gh label create fit-sdk --color 0E8A16 --description 'Garmin FIT SDK release to review' --force
+          existing="$(gh issue list --state open --label fit-sdk --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue edit "$existing" --title "$title" --body-file body.md
+          else
+            gh issue create --title "$title" --label fit-sdk --body-file body.md
+          fi
