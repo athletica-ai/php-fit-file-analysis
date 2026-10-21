@@ -2046,8 +2046,8 @@ class phpFITFileAnalysis
                 if ($session_index >= 0) {
                     $this->summariseWindow('session', $session_index, $field, $from, $to);
                 }
-                foreach ($laps as $lap_index => [$lap_from, $lap_to]) {
-                    if ($lap_from >= $from && $lap_to <= $to) {
+                foreach ($laps as $lap_index => [$lap_from, $lap_to, $lap_start]) {
+                    if ($lap_start >= $from && $lap_start <= $to) {
                         $this->summariseWindow('lap', $lap_index, $field, $lap_from, $lap_to);
                     }
                 }
@@ -2056,24 +2056,30 @@ class phpFITFileAnalysis
     }
 
     /**
-     * CX-87: [start, end] in record timestamps for each session or lap message, by message index.
-     * start_time is stored raw (FIT epoch) while timestamp has the Unix shift applied, so the shift
-     * is applied to start_time here. Messages whose start or end is missing are left out.
+     * CX-87: [from, to] in record timestamps for each session or lap message, by message index. A
+     * message runs from its start_time until the next one starts; the first is open at the front and
+     * the last at the back, so no record falls between windows. The message's own timestamp is not
+     * used as its end: the Stryd reproducer writes it equal to start_time on every session and lap.
+     * start_time is still raw (FIT epoch) at this point -- fixData() shifts it later -- while record
+     * timestamps are already Unix, so the shift is applied here. Empty when any start is missing.
      */
     private function messageWindows($mesg_name)
     {
         $starts = $this->data_mesgs[$mesg_name]['start_time'] ?? [];
-        $ends = $this->data_mesgs[$mesg_name]['timestamp'] ?? [];
-        if (!is_array($starts) || !is_array($ends) || count($starts) !== count($ends)) {
+        if (!is_array($starts) || $starts === [] || in_array(null, $starts, true)) {
             return [];
         }
 
         $shift = $this->garmin_timestamps ? 0 : FIT_UNIX_TS_DIFF;
+        $indexes = array_keys($starts);
         $windows = [];
-        foreach ($starts as $i => $start) {
-            if ($start !== null && isset($ends[$i])) {
-                $windows[$i] = [$start + $shift, $ends[$i]];
-            }
+        foreach ($indexes as $position => $i) {
+            $next = $indexes[$position + 1] ?? null;
+            $windows[$i] = [
+                $position === 0 ? PHP_INT_MIN : $starts[$i] + $shift,
+                $next === null ? PHP_INT_MAX : $starts[$next] + $shift - 1,
+                $starts[$i] + $shift,
+            ];
         }
 
         return $windows;

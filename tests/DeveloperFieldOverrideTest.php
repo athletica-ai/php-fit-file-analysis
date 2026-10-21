@@ -186,7 +186,11 @@ class DeveloperFieldOverrideTest extends \PHPUnit\Framework\TestCase
         return $this->definition(5, self::DEVELOPER_DATA_ID, [[3, 1, self::UINT8]]) . $this->data(5, pack('C', 0));
     }
 
-    /** Session or lap message definition: timestamp, start_time, avg, max, normalized power. */
+    /**
+     * Session or lap message definition: timestamp, start_time, avg, max, normalized power. The
+     * brick and lap tests write timestamp equal to start_time, as the Stryd reproducer does, so a
+     * window must not end at the message's timestamp.
+     */
     private function summaryDefinition($localType, $mesg)
     {
         $numbers = $mesg === self::SESSION ? [20, 21, 34] : [19, 20, 33];
@@ -218,11 +222,11 @@ class DeveloperFieldOverrideTest extends \PHPUnit\Framework\TestCase
         for ($i = 0; $i < 40; $i++) {
             $bytes .= $this->data(1, pack('Vvv', 1000 + $i, 300, 200));
         }
-        $bytes .= $this->summary(3, 1000, 1039, 300, 300, 300);
+        $bytes .= $this->summary(3, 1000, 1000, 300, 300, 300);
         for ($i = 40; $i < 80; $i++) {
             $bytes .= $this->data(2, pack('Vv', 1000 + $i, 250));
         }
-        $bytes .= $this->summary(3, 1040, 1079, 250, 250, 250);
+        $bytes .= $this->summary(3, 1040, 1040, 250, 250, 250);
 
         $pFFA = $this->parseBytes($bytes);
         $power = $pFFA->data_mesgs['record']['power'];
@@ -242,10 +246,10 @@ class DeveloperFieldOverrideTest extends \PHPUnit\Framework\TestCase
         for ($i = 0; $i < 60; $i++) {
             $bytes .= $this->data(1, pack('Vvv', 1000 + $i, 300, $i < 30 ? 200 : 220));
             if ($i === 29 || $i === 59) {
-                $bytes .= $this->summary(3, 1000 + $i - 29, 1000 + $i, 300, 300, 300);
+                $bytes .= $this->summary(3, 1000 + $i - 29, 1000 + $i - 29, 300, 300, 300);
             }
         }
-        $bytes .= $this->summary(4, 1000, 1059, 300, 300, 300);
+        $bytes .= $this->summary(4, 1000, 1000, 300, 300, 300);
 
         $lap = $this->parseBytes($bytes)->data_mesgs['lap'];
 
