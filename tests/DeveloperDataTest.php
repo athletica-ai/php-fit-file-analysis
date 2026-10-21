@@ -114,14 +114,15 @@ class DeveloperDataTest extends \PHPUnit\Framework\TestCase
 
     public function testADeclaredFieldIsCopiedUnderItsNameOnlyWhenTheRecordLacksIt()
     {
-        // "power" declares record field 7, which the records carry: kept. "stryd cadence" declares
-        // cadence (4), which they do not: copied in, as developer_data's raw list.
+        // "power" declares record field 7, which the records carry: kept (with the CX-87 override
+        // off; by default it replaces power, see DeveloperFieldOverrideTest). "stryd cadence"
+        // declares cadence (4), which they do not: copied in, as developer_data's raw list.
         $bytes = $this->developerDataId()
             . $this->description(0, 0, "power\0", 7) . $this->description(4, 1, "stryd cadence\0", 4)
             . $this->definition(1, self::RECORD, [[253, 4, self::UINT32], [7, 2, self::UINT16]], [[0, 2, 0], [1, 2, 0]])
             . $this->data(1, pack('Vvvv', 1000, 300, 200, 85)) . $this->data(1, pack('Vvvv', 1001, 310, 210, 86));
 
-        $record = $this->parse($bytes)->data_mesgs['record'];
+        $record = (new adriangibbons\phpFITFileAnalysis($this->fitFile($bytes), ['input_is_data' => true, 'units' => 'raw', 'overwrite_with_dev_data' => false]))->data_mesgs['record'];
 
         $this->assertSame([$this->ts(0) => 300, $this->ts(1) => 310], $record['power']);
         $this->assertSame([85, 86], $record['stryd cadence']);

@@ -48,11 +48,15 @@ class phpFITFileAnalysis
      */
     public const FIT_UNIX_TS_DIFF = 631065600;
 
+    private const OVERRIDABLE_RECORD_FIELDS = [7];  // CX-87: record field numbers a developer field may replace (power).
+
     /** @var array<string, mixed> Used to store the data read from the file in associative arrays. */
     public $data_mesgs = [];
     private array $dev_field_descriptions = [];
     private array $hr_messages = [];               // hr (132) messages as read: timestamp, event_timestamp, event_timestamp_12, filtered_bpm; see processHrMessages().
     private array $undescribed_dev_values = [];    // Record developer fields read before their field_description: [index][number] => [[pos, size, architecture, record timestamp], ...].
+    private array $dev_override_streams = [];      // CX-87: per native record field a developer field replaces, its valid developer values by record timestamp.
+    private array $applied_overrides = [];         // CX-87: native record fields the override actually replaced in some session.
     private array $options = [];                   // Options provided to __construct(), with defaults filled in.
     private string $file_contents = '';            // The whole FIT file, as read. See __construct().
     private int $file_pointer = 0;                 // Points to the location in the file that shall be read next.
@@ -1260,6 +1264,9 @@ class phpFITFileAnalysis
         // every component. See namedValues().
         $this->options['expand_subfields'] = $options['expand_subfields'] ?? true;
         $this->options['expand_components'] = $options['expand_components'] ?? false;
+        // CX-87: a developer field declaring record power (Stryd's) replaces the watch's power, one
+        // session at a time; see applyDeveloperOverrides(). False reads the file as before.
+        $this->options['overwrite_with_dev_data'] = $options['overwrite_with_dev_data'] ?? true;
         $this->data_mesg_info = self::messageInfo();
         $this->php_trader_ext_loaded = extension_loaded('trader');
 
@@ -1340,6 +1347,8 @@ class phpFITFileAnalysis
             $this->file_pointer = $this->data_end + 2;  // past the file CRC
         } while ($this->anotherFileFollows());
         $this->padDeveloperValues();
+        // CX-87: before the copy, which skips the declarations the override applied.
+        $this->applyDeveloperOverrides();
         $this->copyDeveloperDeclarations();
     }
 
@@ -1927,6 +1936,15 @@ class phpFITFileAnalysis
         } else {
             $this->data_mesgs['developer_data'][$name]['by_mesg'][$mesg_name][] = $value;
         }
+
+        // CX-87: a record's valid value for the native field it replaces; the first declarer with
+        // one wins.
+        if ($mesg_name === 'record' && $record_timestamp !== null && (is_int($value) || is_float($value))) {
+            $native = $this->nativeRecordFieldOverriddenBy($description);
+            if ($native !== null && !isset($this->dev_override_streams[$native][$record_timestamp])) {
+                $this->dev_override_streams[$native][$record_timestamp] = $value;
+            }
+        }
     }
 
     /**
@@ -2087,10 +2105,10 @@ class phpFITFileAnalysis
     /**
      * A developer field declaring a native field (native_field_num) is copied into the record
      * stream under its own name when the record carries no field of that name, as this library has
-     * always done (the 'overwrite_with_dev_data' option has always been forced off, so it never
-     * replaces one). The copy is
-     * developer_data's flat 'data' list, raw. Stryd's cadence on a watch without native cadence
-     * arrives this way, and athletica-app's FitFileParser::getMetricArray() reads such lists.
+     * always done. The copy is developer_data's flat 'data' list, raw. Stryd's cadence on a watch
+     * without native cadence arrives this way, and athletica-app's FitFileParser::getMetricArray()
+     * reads such lists. A declaration the CX-87 override applied is not copied: its values are
+     * already in the native stream.
      */
     private function copyDeveloperDeclarations(): void
     {
@@ -2099,10 +2117,258 @@ class phpFITFileAnalysis
                 if (!isset($description['native_field_num'], $description['field_name'])) {
                     continue;
                 }
+                if (isset($this->applied_overrides[$this->nativeRecordFieldOverriddenBy($description) ?? ''])) {
+                    continue;
+                }
                 if (isset($this->data_mesgs['record'][$description['field_name']])) {
                     continue;
                 }
                 $this->data_mesgs['record'][$description['field_name']] = $this->data_mesgs['developer_data'][$description['field_name']]['data'] ?? [];
+            }
+        }
+    }
+
+    /**
+     * CX-87: the native record field a developer field replaces, or null when it declares none.
+     * A declaration names a message number and a field number; only record (20) overrides are
+     * honoured here, and only for power (field 7). Stryd also declares cadence, ground time and
+     * vertical oscillation, but its ground time and vertical oscillation are not the watch's
+     * quantity in the watch's units (603 ms against 320 ms, 3.4 cm with no scale against 63 mm on
+     * the reproducer), so promoting them would put a foreign value under the native name. They
+     * stay in developer_data.
+     */
+    private function nativeRecordFieldOverriddenBy(array $description): ?string
+    {
+        if (!$this->options['overwrite_with_dev_data']) {
+            return null;
+        }
+        if (($description['native_mesg_num'] ?? null) !== 20 || !in_array($description['native_field_num'] ?? null, self::OVERRIDABLE_RECORD_FIELDS, true)) {
+            return null;
+        }
+
+        return $this->data_mesg_info[20]['field_defns'][$description['native_field_num']]['field_name'] ?? null;
+    }
+
+    /**
+     * CX-87: replace a native record field with the developer values that declare it, one session
+     * at a time.
+     *
+     * A session is overridden only when the developer field carries at least one valid value inside
+     * it. Within such a session every record carries the developer value or nothing -- never the
+     * watch's own value, because the two are not on one scale. That includes, deliberately, the rest
+     * of a session after a pod drops out: a power-duration profile must come from one source, and
+     * missing samples leave a best unchanged where foreign ones would lift it. Outside an overridden
+     * session the native stream is untouched: a brick whose bike leg has a real power meter and no
+     * Stryd keeps that leg's power, and a file where Stryd never wrote a valid value (field
+     * installed, no pod paired) stays a watch-only file, stream and summary alike. A multi-session
+     * file whose sessions cannot be told apart is not overridden; copyDeveloperDeclarations() then
+     * treats it as it always did.
+     *
+     * The session's and its laps' avg_/max_ (and normalized_power for power) are then re-derived
+     * from the stream that survives, rounded to whole units as the device writes them.
+     */
+    private function applyDeveloperOverrides(): void
+    {
+        if ($this->dev_override_streams === [] || empty($this->data_mesgs['record']['timestamp'])) {
+            return;
+        }
+
+        $sessions = $this->sessionWindows();
+        if ($sessions === null) {
+            return;
+        }
+        $timestamps = array_values(array_unique($this->data_mesgs['record']['timestamp']));
+        sort($timestamps);
+
+        foreach ($this->dev_override_streams as $field => $dev_stream) {
+            $overridden = [];
+            foreach ($sessions as $session_index => [$from, $to]) {
+                $in_window = $this->keysInWindow($timestamps, $from, $to);
+                $has_valid = false;
+                foreach ($in_window as $ts) {
+                    if (isset($dev_stream[$ts])) {
+                        $has_valid = true;
+                        break;
+                    }
+                }
+                if (!$has_valid) {
+                    continue;
+                }
+
+                foreach ($in_window as $ts) {
+                    if (isset($dev_stream[$ts])) {
+                        $this->data_mesgs['record'][$field][$ts] = $dev_stream[$ts];
+                    } else {
+                        unset($this->data_mesgs['record'][$field][$ts]);
+                    }
+                }
+                $overridden[$session_index] = [$from, $to];
+            }
+            if ($overridden === []) {
+                continue;
+            }
+            $this->applied_overrides[$field] = true;
+
+            // A timestamp the native stream had no value for was appended at the end; restore time order.
+            ksort($this->data_mesgs['record'][$field]);
+            $keys = array_keys($this->data_mesgs['record'][$field]);
+
+            foreach ($overridden as $session_index => [$from, $to]) {
+                if ($session_index >= 0) {
+                    $this->summariseMessage('session', $session_index, $field, $this->keysInWindow($keys, $from, $to));
+                }
+                foreach ($this->lapWindows($session_index, $from, $to) as $lap_index => $window) {
+                    $this->summariseMessage('lap', $lap_index, $field, $window === null ? [] : $this->keysInWindow($keys, $window[0], $window[1]));
+                }
+            }
+        }
+    }
+
+    /**
+     * CX-87: [from, to] in record timestamps for each session message, by message index. One session
+     * (or none, as -1) is the whole file. Several run from each start_time until the next session's;
+     * the first is open at the front and the last at the back, so no record falls between them. The
+     * message's own timestamp is not used as its end: the Stryd reproducer writes it equal to
+     * start_time. Null when several sessions do not all carry a start_time in order.
+     */
+    private function sessionWindows(): ?array
+    {
+        $count = $this->message_counts['session'] ?? 0;
+        if ($count <= 1) {
+            return [($count === 1 ? 0 : -1) => [PHP_INT_MIN, PHP_INT_MAX]];
+        }
+
+        $starts = [];
+        for ($i = 0; $i < $count; ++$i) {
+            $start = $this->data_mesgs['session']['start_time'][$i] ?? null;
+            if ($start === null || ($i > 0 && $start + $this->timestampShift() <= $starts[$i - 1])) {
+                return null;
+            }
+            $starts[$i] = $start + $this->timestampShift();
+        }
+
+        $windows = [];
+        foreach ($starts as $i => $start) {
+            $windows[$i] = [$i === 0 ? PHP_INT_MIN : $start, isset($starts[$i + 1]) ? $starts[$i + 1] - 1 : PHP_INT_MAX];
+        }
+
+        return $windows;
+    }
+
+    /**
+     * CX-87: the laps of one session, each with its [from, to] clamped to the session, or null for a
+     * lap with no start_time (its figures are cleared rather than left describing the discarded
+     * stream). A session's laps are the ones its first_lap_index / num_laps name when it writes them,
+     * which needs no timestamps; otherwise the laps whose start_time falls inside the session. A lap
+     * runs until the next lap of the session starts.
+     */
+    private function lapWindows(int $session_index, int $from, int $to): array
+    {
+        $starts = $this->data_mesgs['lap']['start_time'] ?? [];
+        $first = $session_index >= 0 ? ($this->data_mesgs['session']['first_lap_index'][$session_index] ?? null) : null;
+        $count = $session_index >= 0 ? ($this->data_mesgs['session']['num_laps'][$session_index] ?? null) : null;
+
+        if ($first !== null && $count !== null) {
+            $laps = [];
+            for ($i = $first; $i < $first + $count && array_key_exists($i, $starts); ++$i) {
+                $laps[$i] = $starts[$i] === null ? null : $starts[$i] + $this->timestampShift();
+            }
+        } elseif (($this->message_counts['session'] ?? 0) <= 1) {
+            $laps = array_map(fn($start) => $start === null ? null : $start + $this->timestampShift(), $starts);
+        } else {
+            // A lap with no start_time goes with the timed lap before it.
+            $laps = [];
+            $in_session = false;
+            foreach ($starts as $i => $start) {
+                if ($start !== null) {
+                    $in_session = $start + $this->timestampShift() >= $from && $start + $this->timestampShift() <= $to;
+                }
+                if ($in_session) {
+                    $laps[$i] = $start === null ? null : $start + $this->timestampShift();
+                }
+            }
+        }
+
+        $timed = array_filter($laps, fn($start) => $start !== null);
+        $indexes = array_keys($timed);
+        $windows = [];
+        foreach ($laps as $i => $start) {
+            if ($start === null) {
+                $windows[$i] = null;
+                continue;
+            }
+            $position = array_search($i, $indexes, true);
+            $next = $indexes[$position + 1] ?? null;
+            $windows[$i] = [
+                $position === 0 ? $from : max($from, $start),
+                min($to, $next === null ? PHP_INT_MAX : $timed[$next] - 1),
+            ];
+        }
+
+        return $windows;
+    }
+
+    /** CX-87: start_time is still raw (FIT epoch) here -- fixData() shifts it later -- while record timestamps are Unix. */
+    private function timestampShift(): int
+    {
+        return $this->garmin_timestamps ? 0 : self::FIT_UNIX_TS_DIFF;
+    }
+
+    /** CX-87: the values of a sorted list that fall in [from, to], found by binary search. */
+    private function keysInWindow(array $sorted, int $from, int $to): array
+    {
+        $lo = 0;
+        $hi = count($sorted);
+        while ($lo < $hi) {
+            $mid = ($lo + $hi) >> 1;
+            if ($sorted[$mid] < $from) {
+                $lo = $mid + 1;
+            } else {
+                $hi = $mid;
+            }
+        }
+
+        $keys = [];
+        for ($i = $lo, $n = count($sorted); $i < $n && $sorted[$i] <= $to; ++$i) {
+            $keys[] = $sorted[$i];
+        }
+
+        return $keys;
+    }
+
+    /**
+     * CX-87: overwrite one session's or lap's avg_/max_ (and normalized_power for power) of a field
+     * with figures from the record values at $timestamps, rounded to whole units as the device
+     * writes them. Power-derived figures this library does not re-derive (training stress score,
+     * intensity factor, total work) are set to null, since they describe the discarded stream; so is
+     * everything when no value survives. Both messages are padded one entry per message (APP-1788),
+     * so $index is the message's own entry; a field the file never wrote is not added.
+     */
+    private function summariseMessage(string $mesg_name, int $index, string $field, array $timestamps): void
+    {
+        $values = [];
+        foreach ($timestamps as $ts) {
+            if (isset($this->data_mesgs['record'][$field][$ts])) {
+                $values[] = $this->data_mesgs['record'][$field][$ts];
+            }
+        }
+
+        $summary = [
+            'avg_' . $field => $values ? (int) round(array_sum($values) / count($values)) : null,
+            'max_' . $field => $values ? (int) round(max($values)) : null,
+        ];
+        if ($field === 'power') {
+            // Too short for one 30-sample rolling window: the mean is the closest figure.
+            $np = $values ? $this->normalisedPower($values) : null;
+            $summary['normalized_power'] = $np === null ? $summary['avg_power'] : (int) round($np);
+            $summary['training_stress_score'] = null;
+            $summary['intensity_factor'] = null;
+            $summary['total_work'] = null;
+        }
+
+        foreach ($summary as $key => $value) {
+            if (isset($this->data_mesgs[$mesg_name][$key]) && array_key_exists($index, $this->data_mesgs[$mesg_name][$key])) {
+                $this->data_mesgs[$mesg_name][$key][$index] = $value;
             }
         }
     }
