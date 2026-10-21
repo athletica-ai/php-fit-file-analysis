@@ -169,10 +169,10 @@ class DeveloperFieldOverrideTest extends \PHPUnit\Framework\TestCase
     private const FLOAT32 = 0x88;
 
     /** A Stryd-style "power" description (developer index 0, field $number, base type $type) declaring native 20/7. */
-    private function powerDescription($localType, $number, $type, $name = "power\0", $scale = null)
+    private function powerDescription($localType, $number, $type, $name = "power\0", $scale = null, $index = 0)
     {
         $fields = [[0, 1, self::UINT8], [1, 1, self::UINT8], [2, 1, self::UINT8], [3, strlen($name), self::STRING], [14, 2, self::UINT16], [15, 1, self::UINT8]];
-        $payload = pack('CCC', 0, $number, $type) . $name . pack('vC', self::RECORD, 7);
+        $payload = pack('CCC', $index, $number, $type) . $name . pack('vC', self::RECORD, 7);
         if ($scale !== null) {
             $fields[] = [6, 1, self::UINT8];
             $payload .= pack('C', $scale);
@@ -311,6 +311,114 @@ class DeveloperFieldOverrideTest extends \PHPUnit\Framework\TestCase
         }
 
         $this->assertSame(200, $this->parseBytes($bytes)->data_mesgs['record']['power'][$this->ts(0)]);
+    }
+
+    /**
+     * Review finding on #9: the per-record replace-a-0 rule mixed two declarers in one session. Stryd
+     * stands still at 0 for ten records while another app writes 250 on the first five; the session
+     * takes Stryd's values only (it has the most readings).
+     */
+    public function testOneDeclarerSuppliesTheWholeSession()
+    {
+        $bytes = $this->developerDataId()
+            . $this->powerDescription(0, 0, self::UINT16) . $this->powerDescription(4, 1, self::UINT16, "other power\0")
+            . $this->definition(1, self::RECORD, [[253, 4, self::UINT32], [7, 2, self::UINT16]], [[0, 2, 0], [1, 2, 0]]);
+        for ($i = 0; $i < 40; $i++) {
+            $bytes .= $this->data(1, pack('Vvvv', 1000 + $i, 300, $i < 10 ? 0 : 200, $i < 5 ? 250 : 0xFFFF));
+        }
+
+        $power = $this->parseBytes($bytes)->data_mesgs['record']['power'];
+
+        $this->assertSame(0, $power[$this->ts(0)], 'Stryd standing still, not the other app');
+        $this->assertSame(200, $power[$this->ts(10)]);
+    }
+
+    /**
+     * Review finding on #9: with Stryd's description after its records, the replayed values arrived
+     * after another declarer's and lost to them. The choice is by declaration, not arrival.
+     */
+    public function testTheChoiceDoesNotDependOnWhereADescriptionSits()
+    {
+        $bytes = $this->developerDataId()
+            . $this->powerDescription(4, 1, self::UINT16, "other power\0")
+            . $this->definition(1, self::RECORD, [[253, 4, self::UINT32], [7, 2, self::UINT16]], [[0, 2, 0], [1, 2, 0]]);
+        for ($i = 0; $i < 40; $i++) {
+            $bytes .= $this->data(1, pack('Vvvv', 1000 + $i, 300, 200, 250));
+            if ($i === 19) {
+                $bytes .= $this->powerDescription(0, 0, self::UINT16);
+            }
+        }
+
+        $power = $this->parseBytes($bytes)->data_mesgs['record']['power'];
+
+        $this->assertSame(200, $power[$this->ts(0)], 'replayed before its description, still the first declarer');
+        $this->assertSame(200, $power[$this->ts(39)]);
+    }
+
+    /** Two records on one timestamp: the later value wins, as for the native fields and developer_data's by_mesg. */
+    public function testOnADuplicateTimestampTheLaterValueWins()
+    {
+        $bytes = $this->developerDataId() . $this->powerDescription(0, 0, self::UINT16)
+            . $this->definition(1, self::RECORD, [[253, 4, self::UINT32], [7, 2, self::UINT16]], [[0, 2, 0]]);
+        for ($i = 0; $i < 40; $i++) {
+            $bytes .= $this->data(1, pack('Vvv', 1000 + $i, 300, 200));
+        }
+        $bytes .= $this->data(1, pack('Vvv', 1005, 310, 150));
+
+        $pFFA = $this->parseBytes($bytes);
+
+        $this->assertSame(150, $pFFA->data_mesgs['record']['power'][$this->ts(5)]);
+        $this->assertSame(150, $pFFA->data_mesgs['developer_data']['power']['by_mesg']['record'][$this->ts(5)]);
+    }
+
+    /**
+     * Review finding on #10: the lowest-index declarer with any reading won, so an app at developer
+     * data index 0 writing 0 with one stray 5 W hid Stryd (index 1) recording throughout.
+     */
+    public function testTheDeclarerWithTheMostReadingsSuppliesTheSession()
+    {
+        $bytes = $this->definition(5, self::DEVELOPER_DATA_ID, [[3, 1, self::UINT8]]) . $this->data(5, pack('C', 0)) . $this->data(5, pack('C', 1))
+            . $this->powerDescription(0, 0, self::UINT16, "zero power\0")
+            . $this->powerDescription(4, 0, self::UINT16, "power\0", null, 1)
+            . $this->definition(1, self::RECORD, [[253, 4, self::UINT32], [7, 2, self::UINT16]], [[0, 2, 0], [0, 2, 1]]);
+        for ($i = 0; $i < 40; $i++) {
+            $bytes .= $this->data(1, pack('Vvvv', 1000 + $i, 300, $i === 7 ? 5 : 0, 200));
+        }
+
+        $power = $this->parseBytes($bytes)->data_mesgs['record']['power'];
+
+        $this->assertSame(200, $power[$this->ts(0)]);
+        $this->assertSame(200, $power[$this->ts(7)], 'Stryd, not the stray 5 W');
+    }
+
+    /** A tie in readings goes to the lower developer data index, before the field number. */
+    public function testATieGoesToTheLowerDeveloperDataIndex()
+    {
+        $bytes = $this->definition(5, self::DEVELOPER_DATA_ID, [[3, 1, self::UINT8]]) . $this->data(5, pack('C', 0)) . $this->data(5, pack('C', 1))
+            . $this->powerDescription(0, 1, self::UINT16)
+            . $this->powerDescription(4, 0, self::UINT16, "other power\0", null, 1)
+            . $this->definition(1, self::RECORD, [[253, 4, self::UINT32], [7, 2, self::UINT16]], [[1, 2, 0], [0, 2, 1]]);
+        for ($i = 0; $i < 40; $i++) {
+            $bytes .= $this->data(1, pack('Vvvv', 1000 + $i, 300, 200, 250));
+        }
+
+        $this->assertSame(200, $this->parseBytes($bytes)->data_mesgs['record']['power'][$this->ts(0)]);
+    }
+
+    /** Review finding on #10: a declarer never chosen lost the copy under its own name that it had before CX-87. */
+    public function testADeclarerNeverChosenIsStillCopiedUnderItsName()
+    {
+        $bytes = $this->developerDataId()
+            . $this->powerDescription(0, 0, self::UINT16) . $this->powerDescription(4, 1, self::UINT16, "other power\0")
+            . $this->definition(1, self::RECORD, [[253, 4, self::UINT32], [7, 2, self::UINT16]], [[0, 2, 0], [1, 2, 0]]);
+        for ($i = 0; $i < 40; $i++) {
+            $bytes .= $this->data(1, pack('Vvvv', 1000 + $i, 300, 200, $i < 5 ? 250 : 0xFFFF));
+        }
+
+        $record = $this->parseBytes($bytes)->data_mesgs['record'];
+
+        $this->assertSame(200, $record['power'][$this->ts(0)]);
+        $this->assertArrayHasKey('other power', $record);
     }
 
     /** Zeros inside a session that has Stryd readings (standing still) are Stryd's, not the watch's. */
