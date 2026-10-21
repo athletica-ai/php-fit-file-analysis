@@ -21,7 +21,11 @@ This repo is public. Never commit real athlete FIT files as fixtures: they carry
 
 ## FIT profile data
 
-The Garmin FIT SDK is the source of truth for product IDs, manufacturers, sports and other enums. The repo doesn't record which FIT profile version its tables came from, so check the SDK rather than other parsers or forum posts.
+The Garmin FIT SDK is the source of truth for messages, fields, scales, units, product IDs, manufacturers, sports and other enums. Check the SDK rather than other parsers or forum posts.
+
+`src/Profile.php` is generated from the SDK's Python `profile.py` by `bin/generate-profile.php`, pinned to the release in `bin/fit-sdk-version.txt` (also `Profile::VERSION`). Don't edit it by hand: CI's `php bin/generate-profile.php --check` fails if it differs from what the pinned SDK generates. To move to a new SDK, run `composer profile -- --version=X.Y.Z --summary=summary.md` and review the summary (it flags scale and unit changes to fields already decoded). `.github/workflows/fit-sdk-watch.yml` opens a `fit-sdk` issue each time Garmin releases one.
+
+The hand-written `$enum_data` tables in `src/phpFITFileAnalysis.php` hold only the names this library has always returned (e.g. `Garmin`, `Forerunner 970`); any other value is named from `Profile::TYPES`. Product IDs 13, 15, 16 and 22 stay `unknown` on purpose (APP-2016).
 
 ## Conventions
 

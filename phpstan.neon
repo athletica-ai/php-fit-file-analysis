@@ -1,0 +1,17 @@
+parameters:
+    level: 6
+    paths:
+        - src
+        - bin
+    # The library's public methods predate type declarations and keep their signatures for
+    # existing callers, so their missing parameter/return types are not reported; everything else
+    # at level 6 is.
+    ignoreErrors:
+        -
+            identifier: missingType.iterableValue
+        -
+            identifier: missingType.parameter
+            path: src/phpFITFileAnalysis.php
+        -
+            identifier: missingType.return
+            path: src/phpFITFileAnalysis.php

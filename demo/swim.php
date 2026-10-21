@@ -21,10 +21,10 @@ try {
 }
 $units = 'm';
 $pool_length = $pFFA->data_mesgs['session']['pool_length'];
-$total_distance = number_format($pFFA->data_mesgs['record']['distance']);
+$total_distance = number_format(max((array) $pFFA->data_mesgs['record']['distance']));
 if ($pFFA->enumData('display_measure', $pFFA->data_mesgs['session']['pool_length_unit']) == 'statute') {
     $pool_length = round($pFFA->data_mesgs['session']['pool_length'] * 1.0936133);
-    $total_distance = number_format($pFFA->data_mesgs['record']['distance'] * 1.0936133);
+    $total_distance = number_format(max((array) $pFFA->data_mesgs['record']['distance']) * 1.0936133);
     $units = 'yd';
 }
 ?>
@@ -60,7 +60,7 @@ if ($pFFA->enumData('display_measure', $pFFA->data_mesgs['session']['pool_length
           <dt>Pool length: </dt>
           <dd><?php echo $pool_length.' '.$units; ?></dd>
           <dt>Duration: </dt>
-          <dd><?php echo gmdate('H:i:s', $pFFA->data_mesgs['session']['total_elapsed_time']); ?></dd>
+          <dd><?php echo gmdate('H:i:s', (int) $pFFA->data_mesgs['session']['total_elapsed_time']); ?></dd>
           <dt>Total distance: </dt>
           <dd><?php echo $total_distance.' '.$units; ?></dd>
         </dl>
