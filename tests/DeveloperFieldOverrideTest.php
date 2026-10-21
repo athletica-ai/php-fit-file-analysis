@@ -372,7 +372,8 @@ class DeveloperFieldOverrideTest extends \PHPUnit\Framework\TestCase
 
     /**
      * Second review: one lap without a valid start_time stopped every lap being re-summarised, and a
-     * lap's window ran past its session into the next one. Run laps start at 1000 and 1020, a padded
+     * lap's window ran past its session into the next one. Third review: the padded lap kept the
+     * watch's figures; it goes with the timed lap before it and is cleared. Run laps start at 1000 and 1020, a padded
      * lap with no start follows, and the bike's lap starts at 1050 though the bike session starts at
      * 1040, so the run's last lap would otherwise take ten bike samples.
      */
@@ -386,7 +387,7 @@ class DeveloperFieldOverrideTest extends \PHPUnit\Framework\TestCase
 
         $lap = $this->parseBytes($bytes)->data_mesgs['lap'];
 
-        $this->assertSame([200, 200, 300, 250], $lap['avg_power'], 'run laps re-derived, the padded lap left, the bike lap untouched');
+        $this->assertSame([200, 200, null, 250], $lap['avg_power'], 'run laps re-derived, the padded run lap cleared, the bike lap untouched');
     }
 
     /** Second review: a session without start_time made the brick one window and wiped the bike leg. */
@@ -400,6 +401,76 @@ class DeveloperFieldOverrideTest extends \PHPUnit\Framework\TestCase
 
         $this->assertSame(300, $power[$this->ts(0)]);
         $this->assertSame(250, $power[$this->ts(40)]);
+    }
+
+    /** Session message with timestamp, start_time, avg/max power and, when $laps is set, first_lap_index / num_laps. */
+    private function sessionWithLaps($localType, $start, $avg, $firstLap, $numLaps)
+    {
+        return $this->definition($localType, self::SESSION, [[253, 4, self::UINT32], [2, 4, self::UINT32], [20, 2, self::UINT16], [21, 2, self::UINT16], [25, 2, self::UINT16], [26, 2, self::UINT16]])
+            . $this->data($localType, pack('VVvvvv', $start, $start, $avg, $avg, $firstLap, $numLaps));
+    }
+
+    /**
+     * Third review: sessions were counted by their timestamp list, so a brick whose bike session has
+     * an invalid timestamp counted as one session and the whole file was overridden.
+     */
+    public function testABrickWithAnInvalidSessionTimestampStillKeepsTheBikeLeg()
+    {
+        $bytes = $this->runThenRideHeader() . $this->summaryDefinition(4, self::SESSION)
+            . $this->runThenRide()
+            . $this->summary(4, 1000, 1000, 300, 300, 300) . $this->summary(4, 1040, 0xFFFFFFFF, 250, 250, 250);
+
+        $pFFA = $this->parseBytes($bytes);
+
+        $this->assertSame(200, $pFFA->data_mesgs['record']['power'][$this->ts(39)]);
+        $this->assertSame(250, $pFFA->data_mesgs['record']['power'][$this->ts(40)]);
+        $this->assertSame([200, 250], $pFFA->data_mesgs['session']['avg_power']);
+    }
+
+    /**
+     * Third review: a multi-session file the override leaves alone lost Stryd power altogether when
+     * the watch wrote none, because the old copy skipped the power declaration too.
+     */
+    public function testAFileTheOverrideLeavesAloneStillGetsTheOldCopy()
+    {
+        $bytes = $this->developerDataId() . $this->powerDescription(0, 0, self::UINT16)
+            . $this->definition(1, self::RECORD, [[253, 4, self::UINT32]], [[0, 2, 0]]) . $this->summaryDefinition(4, self::SESSION);
+        for ($i = 0; $i < 4; $i++) {
+            $bytes .= $this->data(1, pack('Vv', 1000 + $i, 200));
+        }
+        $bytes .= $this->summary(4, 1000, 1000, 0, 0, 0) . $this->summary(4, 0xFFFFFFFF, 1002, 0, 0, 0);
+
+        $this->assertSame([200, 200, 200, 200], $this->parseBytes($bytes)->data_mesgs['record']['power']);
+    }
+
+    /**
+     * Third review: a session whose definition lacks avg/max power left the lists shorter than the
+     * session count, and the overridden session's summary was silently skipped. A swim session with
+     * no power fields precedes the Stryd run.
+     */
+    public function testASessionWithoutPowerFieldsDoesNotStopTheNextBeingSummarised()
+    {
+        $swim = $this->definition(6, self::SESSION, [[253, 4, self::UINT32], [2, 4, self::UINT32]]);
+        $bytes = $this->runThenRideHeader() . $swim . $this->summaryDefinition(4, self::SESSION)
+            . $this->data(6, pack('VV', 990, 990)) . $this->runThenRide(false) . $this->summary(4, 1000, 1000, 300, 300, 300);
+
+        $this->assertSame(200, $this->parseBytes($bytes)->data_mesgs['session']['avg_power'], 'one value, so a scalar, and the run\'s not the watch\'s 300');
+    }
+
+    /**
+     * Third review: a lap was placed by its start_time alone, so one starting a second before its
+     * session went to the previous session. A session's first_lap_index / num_laps place it instead.
+     */
+    public function testLapsArePlacedByTheSessionsLapIndexWhenItHasOne()
+    {
+        $bytes = $this->runThenRideHeader() . $this->summaryDefinition(3, self::LAP)
+            . $this->runThenRide()
+            . $this->summary(3, 999, 999, 300, 300, 300) . $this->summary(3, 1039, 1039, 250, 250, 250)
+            . $this->sessionWithLaps(4, 1000, 300, 0, 1) . $this->sessionWithLaps(5, 1040, 250, 1, 1);
+
+        $lap = $this->parseBytes($bytes)->data_mesgs['lap'];
+
+        $this->assertSame([200, 250], $lap['avg_power'], 'the run lap starting at 999 is the run session\'s; the bike lap starting at 1039 is the bike\'s');
     }
 
     /** Second review: TSS, IF and total work kept describing the watch's stream. */
@@ -439,7 +510,7 @@ class DeveloperFieldOverrideTest extends \PHPUnit\Framework\TestCase
             $bytes .= $this->data(2, pack('Vv', 1000 + $i, 250));
         }
 
-        $this->expectException(\DivisionByZeroError::class);
+        $this->expectException(\Exception::class);
         $this->parseBytes($bytes)->powerMetrics(250);
     }
 
