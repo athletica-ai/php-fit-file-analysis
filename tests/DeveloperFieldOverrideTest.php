@@ -391,6 +391,20 @@ class DeveloperFieldOverrideTest extends \PHPUnit\Framework\TestCase
         $this->assertSame(200, $power[$this->ts(7)], 'Stryd, not the stray 5 W');
     }
 
+    /** A tie in readings goes to the lower developer data index, before the field number. */
+    public function testATieGoesToTheLowerDeveloperDataIndex()
+    {
+        $bytes = $this->definition(5, self::DEVELOPER_DATA_ID, [[3, 1, self::UINT8]]) . $this->data(5, pack('C', 0)) . $this->data(5, pack('C', 1))
+            . $this->powerDescription(0, 1, self::UINT16)
+            . $this->powerDescription(4, 0, self::UINT16, "other power\0", null, 1)
+            . $this->definition(1, self::RECORD, [[253, 4, self::UINT32], [7, 2, self::UINT16]], [[1, 2, 0], [0, 2, 1]]);
+        for ($i = 0; $i < 40; $i++) {
+            $bytes .= $this->data(1, pack('Vvvv', 1000 + $i, 300, 200, 250));
+        }
+
+        $this->assertSame(200, $this->parseBytes($bytes)->data_mesgs['record']['power'][$this->ts(0)]);
+    }
+
     /** Review finding on #10: a declarer never chosen lost the copy under its own name that it had before CX-87. */
     public function testADeclarerNeverChosenIsStillCopiedUnderItsName()
     {
