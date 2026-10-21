@@ -55,7 +55,7 @@ class phpFITFileAnalysis
     private array $dev_field_descriptions = [];
     private array $hr_messages = [];               // hr (132) messages as read: timestamp, event_timestamp, event_timestamp_12, filtered_bpm; see processHrMessages().
     private array $undescribed_dev_values = [];    // Record developer fields read before their field_description: [index][number] => [[pos, size, architecture, record timestamp], ...].
-    private array $dev_override_streams = [];      // CX-87: per native record field a developer field replaces, its developer value by record timestamp (null = invalid).
+    private array $dev_override_streams = [];      // CX-87: per native record field a developer field replaces, its valid developer values by record timestamp.
     private array $applied_overrides = [];         // CX-87: native record fields the override actually replaced in some session.
     private array $options = [];                   // Options provided to __construct(), with defaults filled in.
     private string $file_contents = '';            // The whole FIT file, as read. See __construct().
@@ -1937,12 +1937,12 @@ class phpFITFileAnalysis
             $this->data_mesgs['developer_data'][$name]['by_mesg'][$mesg_name][] = $value;
         }
 
-        // CX-87: a record's value for the native field it replaces. The first declarer with a valid
-        // value on a record wins; null marks a record that carried the field invalid.
-        if ($mesg_name === 'record' && $record_timestamp !== null) {
+        // CX-87: a record's valid value for the native field it replaces; the first declarer with
+        // one wins.
+        if ($mesg_name === 'record' && $record_timestamp !== null && (is_int($value) || is_float($value))) {
             $native = $this->nativeRecordFieldOverriddenBy($description);
             if ($native !== null && !isset($this->dev_override_streams[$native][$record_timestamp])) {
-                $this->dev_override_streams[$native][$record_timestamp] = is_int($value) || is_float($value) ? $value : null;
+                $this->dev_override_streams[$native][$record_timestamp] = $value;
             }
         }
     }

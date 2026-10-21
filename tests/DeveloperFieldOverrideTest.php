@@ -423,6 +423,34 @@ class DeveloperFieldOverrideTest extends \PHPUnit\Framework\TestCase
         $this->assertSame(250, $power[$this->ts(40)]);
     }
 
+    /** Sessions whose start times run backwards cannot be told apart either: the brick is left alone. */
+    public function testABrickWhoseSessionsAreOutOfOrderIsLeftAsItIs()
+    {
+        $bytes = $this->runThenRideHeader() . $this->summaryDefinition(4, self::SESSION)
+            . $this->runThenRide()
+            . $this->summary(4, 1040, 1040, 250, 250, 250) . $this->summary(4, 1000, 1000, 300, 300, 300);
+
+        $power = $this->parseBytes($bytes)->data_mesgs['record']['power'];
+
+        $this->assertSame(300, $power[$this->ts(0)]);
+        $this->assertSame(250, $power[$this->ts(40)]);
+    }
+
+    /** A declarer named other than "power" is not also copied in under its own name once it has replaced power. */
+    public function testAnAppliedOverrideIsNotAlsoCopiedUnderItsOwnName()
+    {
+        $bytes = $this->developerDataId() . $this->powerDescription(0, 0, self::UINT16, "stryd power\0")
+            . $this->definition(1, self::RECORD, [[253, 4, self::UINT32], [7, 2, self::UINT16]], [[0, 2, 0]]);
+        for ($i = 0; $i < 40; $i++) {
+            $bytes .= $this->data(1, pack('Vvv', 1000 + $i, 300, 200));
+        }
+
+        $record = $this->parseBytes($bytes)->data_mesgs['record'];
+
+        $this->assertSame(200, $record['power'][$this->ts(0)]);
+        $this->assertArrayNotHasKey('stryd power', $record);
+    }
+
     /** Session message with timestamp, start_time, avg/max power and, when $laps is set, first_lap_index / num_laps. */
     private function sessionWithLaps($localType, $start, $avg, $firstLap, $numLaps)
     {
