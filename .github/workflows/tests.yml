@@ -20,7 +20,7 @@ jobs:
       - uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php }}
-          extensions: json
+          extensions: json, mbstring
           coverage: none
 
       - name: Install dependencies
@@ -28,3 +28,9 @@ jobs:
 
       - name: Run tests
         run: vendor/bin/phpunit
+
+      - name: Static analysis
+        run: composer phpstan -- --no-progress
+
+      - name: src/Profile.php is what the pinned FIT SDK generates
+        run: php bin/generate-profile.php --check

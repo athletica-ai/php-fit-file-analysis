@@ -75,7 +75,7 @@ try {
 ?>
         </dd>
         <dt>Duration: </dt>
-        <dd><?php echo gmdate('H:i:s', $pFFA->data_mesgs['session']['total_elapsed_time']); ?></dd>
+        <dd><?php echo gmdate('H:i:s', (int) $pFFA->data_mesgs['session']['total_elapsed_time']); ?></dd>
         <dt>Distance: </dt>
         <dd><?php echo max($pFFA->data_mesgs['record']['distance']); ?> km</dd>
       </dl>

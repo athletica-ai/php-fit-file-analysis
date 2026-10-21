@@ -19,44 +19,61 @@ namespace adriangibbons;
  * http://www.thisisant.com/resources/fit
  */
 
+// For callers that require this file directly rather than through Composer's autoloader.
+foreach (['FitParseException', 'FitBitStream', 'Profile'] as $class) {
+    if (!class_exists(__NAMESPACE__ . '\\' . $class)) {
+        require_once __DIR__ . '/' . $class . '.php';
+    }
+}
+unset($class);
+
+// Global constants kept for callers that use them; the class uses its own constants.
+// DEFINITION_MESSAGE and DATA_MESSAGE are no longer used by the library.
 if (!defined('DEFINITION_MESSAGE')) {
     define('DEFINITION_MESSAGE', 1);
 }
 if (!defined('DATA_MESSAGE')) {
     define('DATA_MESSAGE', 0);
 }
-
-/*
- * This is the number of seconds difference between FIT and Unix timestamps.
- * FIT timestamps are seconds since UTC 00:00:00 Dec 31 1989 (source FIT SDK)
- * Unix time is the number of seconds since UTC 00:00:00 Jan 01 1970
- */
 if (!defined('FIT_UNIX_TS_DIFF')) {
-    define('FIT_UNIX_TS_DIFF', 631065600);
+    define('FIT_UNIX_TS_DIFF', phpFITFileAnalysis::FIT_UNIX_TS_DIFF);
 }
 
 class phpFITFileAnalysis
 {
+    /*
+     * This is the number of seconds difference between FIT and Unix timestamps.
+     * FIT timestamps are seconds since UTC 00:00:00 Dec 31 1989 (source FIT SDK)
+     * Unix time is the number of seconds since UTC 00:00:00 Jan 01 1970
+     */
+    public const FIT_UNIX_TS_DIFF = 631065600;
+
     private const OVERRIDABLE_RECORD_FIELDS = [7];  // CX-87: record field numbers a developer field may replace (power).
 
-    public $data_mesgs = [];  // Used to store the data read from the file in associative arrays.
-    private $dev_field_descriptions = [];
-    private $dev_override_streams = [];      // CX-87: per native record field a developer field replaces, its developer value by record timestamp (null = invalid).
-    private $applied_overrides = [];         // CX-87: native record fields the override actually replaced in some session.
-    private $session_messages = [];          // CX-87: per session message read, the position of each session field it wrote (session lists are not padded per message).
-    private $options = null;                 // Options provided to __construct().
-    private $file_contents = '';             // FIT file is read-in to memory as a string, split into an array, and reversed. See __construct().
-    private $file_pointer = 0;               // Points to the location in the file that shall be read next.
-    private $defn_mesgs = [];                // Array of FIT 'Definition Messages', which describe the architecture, format, and fields of 'Data Messages'.
-    private $defn_mesgs_all = [];            // Keeps a record of all Definition Messages as index ($local_mesg_type) of $defn_mesgs may be reused in file.
-    private $file_header = [];               // Contains information about the FIT file such as the Protocol version, Profile version, and Data Size.
-    private $php_trader_ext_loaded = false;  // Is the PHP Trader extension loaded? Use $this->sma() algorithm if not available.
-    private $types = null;                   // Set by $endianness depending on architecture in Definition Message.
-    private $garmin_timestamps = false;      // By default the constant FIT_UNIX_TS_DIFF will be added to timestamps.
+    /** @var array<string, mixed> Used to store the data read from the file in associative arrays. */
+    public $data_mesgs = [];
+    private array $dev_field_descriptions = [];
+    private array $hr_messages = [];               // hr (132) messages as read: timestamp, event_timestamp, event_timestamp_12, filtered_bpm; see processHrMessages().
+    private array $undescribed_dev_values = [];    // Record developer fields read before their field_description: [index][number] => [[pos, size, architecture, record timestamp], ...].
+    private array $dev_override_streams = [];      // CX-87: per native record field a developer field replaces, its developer value by record timestamp (null = invalid).
+    private array $applied_overrides = [];         // CX-87: native record fields the override actually replaced in some session.
+    private array $options = [];                   // Options provided to __construct(), with defaults filled in.
+    private string $file_contents = '';            // The whole FIT file, as read. See __construct().
+    private int $file_pointer = 0;                 // Points to the location in the file that shall be read next.
+    private array $defn_mesgs = [];                // Array of FIT 'Definition Messages', which describe the architecture, format, and fields of 'Data Messages'.
+    private array $defn_mesgs_all = [];            // Keeps a record of all Definition Messages as index ($local_mesg_type) of $defn_mesgs may be reused in file.
+    private array $file_header = [];               // Contains information about the FIT file such as the Protocol version, Profile version, and Data Size.
+    private bool $php_trader_ext_loaded = false;   // Is the PHP Trader extension loaded? Use $this->sma() algorithm if not available.
+    private int $data_end = 0;                     // Offset just past the data records of the FIT file being read (its CRC follows).
+    private ?int $last_timestamp = null;           // Latest timestamp of any message (FIT epoch): the reference for compressed timestamp headers.
+    private ?int $max_record_timestamp = null;     // APP-1554: running maximum of record timestamps.
+    private array $message_counts = [];            // Messages read so far, by name, for padMessageFields().
+    private array $accumulators = [];              // FIT SDK accumulated fields: [global mesg num][field num] => [total, last raw value].
+    private bool $garmin_timestamps = false;       // By default self::FIT_UNIX_TS_DIFF will be added to timestamps.
 
     // Enumerated data looked up by enumData().
     // Values from 'Profile.xls' contained within the FIT SDK.
-    private $enum_data = [
+    private array $enum_data = [
         'activity' => [0 => 'manual', 1 => 'auto_multi_sport'],
         'ant_network' => [0 => 'public', 1 => 'antplus', 2 => 'antfs', 3 => 'private'],
         'battery_status' => [1 => 'new', 2 => 'good', 3 => 'ok', 4 => 'low', 5 => 'critical', 7 => 'unknown'],
@@ -427,6 +444,11 @@ class phpFITFileAnalysis
             5759 => 'actigraphcorp'
         ],
         'pwr_zone_calc' => [0 => 'custom', 1 => 'percent_ftp'],
+        // Source of truth for product IDs: garminProduct in Garmin's FIT SDK profile
+        // (https://github.com/garmin/fit-javascript-sdk/blob/main/src/profile.js). Last checked against v21.218.0.
+        // SDK IDs 13, 15, 16 and 22 (single-byte ANT+ sensor IDs) are left out on purpose: this table is looked up
+        // whatever the manufacturer, and those IDs are Suunto, Polar and Wahoo watches, which callers name only
+        // when this returns 'unknown'.
         'product' => [  // Have formatted for devices known to use FIT format. (Original text commented-out).
             1 => 'hrm1',
             2 => 'axh01',
@@ -441,6 +463,7 @@ class phpFITFileAnalysis
             11 => 'axs01',
             12 => 'HRM-Tri',                    // 'hrm_tri_single_byte_product_id',
             14 => 'Forerunner 225',             // 'fr225_single_byte_product_id',
+            255 => 'Optical HR',
             473 => 'Forerunner 301',            // 'fr301_china',
             474 => 'Forerunner 301',            // 'fr301_japan',
             475 => 'Forerunner 301',            // 'fr301_korea',
@@ -469,6 +492,7 @@ class phpFITFileAnalysis
             1381 => 'Vector 2',                 // vector_cp
             1386 => 'Edge 800',                 // 'edge800_china',
             1387 => 'Edge 500',                 // 'edge500_china',
+            1405 => 'Approach G10',
             1410 => 'Forerunner 610',           // 'fr610_japan',
             1422 => 'Edge 500',                 // 'edge500_korea',
             1436 => 'Forerunner 70',            // 'fr70',
@@ -535,6 +559,7 @@ class phpFITFileAnalysis
             2153 => 'Forerunner 225',           // fr225
             2156 => 'Forerunner 630',           // fr630
             2157 => 'Forerunner 230',           // fr230
+            2158 => 'Forerunner 735XT',
             2160 => 'vivo_active_apac',
             2161 => 'Vector 2',                 // vector_2
             2162 => 'Vector 2S',                // vector_2s
@@ -542,6 +567,7 @@ class phpFITFileAnalysis
             2173 => 'Forerunner 620',           // fr620_taiwan
             2174 => 'Forerunner 220',           // fr220_taiwan
             2175 => 'truswing',
+            2187 => 'D2 Air Venu',
             2188 => 'Fenix 3',                  // fenix3_china
             2189 => 'Fenix 3',                  // fenix3_twn
             2192 => 'varia_headlight',
@@ -551,16 +577,37 @@ class phpFITFileAnalysis
             2225 => 'varia_radar_taillight',
             2226 => 'varia_radar_display',
             2238 => 'Edge 20',                  // edge20
+            2260 => 'Edge 520 Asia',
+            2261 => 'Edge 520 Japan',
             2262 => 'D2 Bravo',                 // d2_bravo
             2266 => 'approach_s20',
+            2271 => 'Vivosmart 2',
+            2274 => 'Edge 1000 Thai',
             2276 => 'varia_remote',
+            2288 => 'Edge 25 Asia',
+            2289 => 'Edge 25 Japan',
+            2290 => 'Edge 20 Asia',
+            2292 => 'Approach X40',
+            2293 => 'Fenix 3 Japan',
+            2294 => 'Vivosmart EMEA',
+            2310 => 'Forerunner 630 Asia',
+            2311 => 'Forerunner 630 Japan',
+            2313 => 'Forerunner 230 Japan',
             2327 => 'hrm4_run',
+            2332 => 'Epix Japan',
             2337 => 'vivo_active_hr',
             2347 => 'vivo_smart_gps_hr',
             2348 => 'vivo_smart_hr',
+            2361 => 'Vivosmart HR Asia',
+            2362 => 'Vivosmart GPS HR Asia',
             2368 => 'vivo_move',
+            2379 => 'Varia Taillight',
+            2396 => 'Forerunner 235 Asia',
+            2397 => 'Forerunner 235 Japan',
             2398 => 'varia_vision',
             2406 => 'vivo_fit3',
+            2407 => 'Fenix 3 Korea',
+            2408 => 'Fenix 3 SEA',
             2413 => 'Fenix 3 HR',               // fenix3_hr
             2417 => 'Virb Ultra 30',            // virb_ultra_30
             2429 => 'index_smart_scale',
@@ -568,36 +615,81 @@ class phpFITFileAnalysis
             2432 => 'Fenix 3 Chronos',          // fenix3_chronos
             2441 => 'oregon7xx',
             2444 => 'rino7xx',
+            2457 => 'Epix Korea',
+            2473 => 'Fenix 3 HR China',
+            2474 => 'Fenix 3 HR Taiwan',
+            2475 => 'Fenix 3 HR Japan',
+            2476 => 'Fenix 3 HR SEA',
+            2477 => 'Fenix 3 HR Korea',
             2496 => 'nautix',
+            2497 => 'Vivoactive HR APAC',
+            2503 => 'Forerunner 35',
+            2512 => 'Oregon 7xx',
             2530 => 'Edge 820',                 // edge_820
             2531 => 'Edge Explore 820',         // edge_explore_820
+            2533 => 'Forerunner 735XT APAC',
+            2534 => 'Forerunner 735XT Japan',
             2544 => 'fenix5s',
             2547 => 'D2 Bravo Titanium',        // d2_bravo_titanium
+            2567 => 'Varia UT800',
             2593 => 'Running Dynamics Pod',     // running_dynamics_pod
+            2599 => 'Edge 820 China',
+            2600 => 'Edge 820 Japan',
             2604 => 'Fenix 5x',                 // fenix5x
             2606 => 'vivofit jr',               // vivo_fit_jr
+            2622 => 'Vivosmart 3',
+            2623 => 'Vivosport',
+            2628 => 'Edge 820 Taiwan',
+            2629 => 'Edge 820 Korea',
+            2630 => 'Edge 820 SEA',
+            2650 => 'Forerunner 35 Hebrew',
+            2656 => 'Approach S60',
+            2667 => 'Forerunner 35 APAC',
+            2668 => 'Forerunner 35 Japan',
+            2675 => 'Fenix 3 Chronos Asia',
+            2687 => 'Virb 360',
             2691 => 'Forerunner 935',           // fr935
             2697 => 'Fenix 5',                  // fenix5
             2700 => 'vivoactive3',
             2769 => 'foretrex_601_701',
             2772 => 'vivo_move_hr',
+            2787 => 'Vector 3',
+            2796 => 'Fenix 5 Asia',
+            2797 => 'Fenix 5S Asia',
+            2798 => 'Fenix 5X Asia',
             2713 => 'Edge 1030',                // edge_1030
+            2727 => 'Forerunner 35 SEA',
+            2733 => 'Forerunner 235 China NFC',
             2806 => 'approach_z80',
+            2814 => 'Forerunner 35 Korea',
+            2819 => 'D2 Charlie',
             2831 => 'vivo_smart3_apac',
             2832 => 'vivo_sport_apac',
+            2833 => 'Forerunner 935 Asia',
             2859 => 'descent',
+            2878 => 'Vivofit 4',
             2886 => 'Forerunner 645',           // fr645
             2888 => 'Forerunner 645',           // fr645m
+            2891 => 'Forerunner 30',
             2900 => 'Fenix 5S Plus',            // fenix5s_plus
             2909 => 'Edge 130',                 // Edge_130
+            2924 => 'Edge 1030 Asia',
             2927 => 'vivosmart_4',
+            2945 => 'Vivomove HR Asia',
             2962 => 'approach_x10',
+            2977 => 'Forerunner 30 Asia',
             2988 => 'vivoactive3m_w',
+            3003 => 'Forerunner 645 Asia',
+            3004 => 'Forerunner 645M Asia',
             3011 => 'edge_explore',
             3028 => 'gpsmap66',
             3049 => 'approach_s10',
             3066 => 'vivoactive3m_l',
+            3076 => 'Forerunner 245',
+            3077 => 'Forerunner 245 Music',
             3085 => 'approach_g80',
+            3092 => 'Edge 130 Asia',
+            3095 => 'Edge 1030 Bontrager',
             3110 => 'Fenix 5 Plus',             // fenix5_plus
             3111 => 'Fenix 5X Plus',            // fenix5x_plus
             3112 => 'Edge 520 Plus',            // edge_520_plus
@@ -605,6 +697,16 @@ class phpFITFileAnalysis
             3121 => 'Edge 530',
             3122 => 'Edge 830',
             3126 => 'Instinct Esports',
+            3134 => 'Fenix 5S Plus APAC',
+            3135 => 'Fenix 5X Plus APAC',
+            3142 => 'Edge 520 Plus APAC',
+            3143 => 'Descent T1',
+            3144 => 'Forerunner 235L Asia',
+            3145 => 'Forerunner 245 Asia',
+            3163 => 'Vivoactive 3M APAC',
+            3192 => 'Bike Speed Sensor',        // gen3_bsm
+            3193 => 'Bike Cadence Sensor',      // gen3_bcm
+            3218 => 'Vivosmart 4 Asia',
             3224 => 'Vivoactive 4S',
             3225 => 'Vivoactive 4',
             3226 => 'Venu',
@@ -616,6 +718,7 @@ class phpFITFileAnalysis
             3251 => 'MARQ Athlete',
             3258 => 'Descent Mk2',
             3282 => 'Forerunner 45',
+            3284 => 'GPSMAP 66i',
             3287 => 'Fenix 6S Sport',
             3288 => 'Fenix 6S',
             3289 => 'Fenix 6 Sport',
@@ -623,6 +726,7 @@ class phpFITFileAnalysis
             3291 => 'Fenix 6X',
             3299 => 'hrm_dual',
             3300 => 'HRM Pro',
+            3308 => 'Vivomove 3 Premium',
             3314 => 'approach_s40',
 
             // Newer Garmin products (2019+) - Source: Garmin FIT SDK Profile.xlsx
@@ -632,11 +736,13 @@ class phpFITFileAnalysis
             3378 => 'Vivomove 3',
             3387 => 'Vivoactive 4S Asia',
             3388 => 'Vivoactive 4 Asia',
+            3389 => 'Vivoactive 4 OLED Asia',
             3405 => 'Swim 2',
             3420 => 'MARQ Driver Asia',
             3421 => 'MARQ Aviator Asia',
             3422 => 'Vivomove 3 Asia',
             3441 => 'Forerunner 945 Asia',
+            3446 => 'Vivoactive 3T China',
             3448 => 'MARQ Captain Asia',
             3449 => 'MARQ Commander Asia',
             3450 => 'MARQ Expedition Asia',
@@ -644,6 +750,7 @@ class phpFITFileAnalysis
             3461 => 'Index Smart Scale 2',
             3466 => 'Instinct Solar',
             3469 => 'Forerunner 45 Asia',
+            3473 => 'Vivoactive 3 Daimler',
             3498 => 'Legacy Rey',
             3499 => 'Legacy Darth Vader',
             3500 => 'Legacy Captain Marvel',
@@ -653,30 +760,41 @@ class phpFITFileAnalysis
             3514 => 'Fenix 6 Sport Asia',
             3515 => 'Fenix 6 Asia',
             3516 => 'Fenix 6X Asia',
+            3535 => 'Legacy Captain Marvel Asia',
+            3536 => 'Legacy First Avenger Asia',
+            3537 => 'Legacy Rey Asia',
+            3538 => 'Legacy Darth Vader Asia',
             3542 => 'Descent Mk2S',
             3558 => 'Edge 130 Plus',
             3570 => 'Edge 1030 Plus',
             3578 => 'Rally 200',
             3589 => 'Forerunner 745',
             3596 => 'Venu Sq Music',
+            3599 => 'Venu Sq Music V2',
             3600 => 'Venu Sq',
             3615 => 'Lily',
             3624 => 'MARQ Adventurer',
             3638 => 'Enduro',
+            3639 => 'Swim 2 APAC',
             3648 => 'MARQ Adventurer Asia',
             3652 => 'Forerunner 945 LTE',
             3702 => 'Descent Mk2 Asia',
             3703 => 'Venu 2',
             3704 => 'Venu 2S',
+            3737 => 'Venu Daimler Asia',
             3739 => 'MARQ Golfer',
+            3740 => 'Venu Daimler',
             3794 => 'Forerunner 745 Asia',
             3808 => 'Varia RCT715',
+            3809 => 'Lily Asia',
             3812 => 'Edge 1030 Plus Asia',
             3813 => 'Edge 130 Plus Asia',
             3823 => 'Approach S12',
             3837 => 'Venu Sq Asia',
             3843 => 'Edge 1040',
+            3850 => 'MARQ Golfer Asia',
             3851 => 'Venu 2 Plus',
+            3865 => 'GNSS',                     // Airoha AG3335M chip
             3869 => 'Forerunner 55',
             3872 => 'Enduro Asia',
             3888 => 'Instinct 2',
@@ -684,12 +802,20 @@ class phpFITFileAnalysis
             3905 => 'Fenix 7S',
             3906 => 'Fenix 7',
             3907 => 'Fenix 7X',
+            3908 => 'Fenix 7S APAC',
+            3909 => 'Fenix 7 APAC',
+            3910 => 'Fenix 7X APAC',
             3927 => 'Approach G12',
+            3930 => 'Descent Mk2S Asia',
             3934 => 'Approach S42',
             3943 => 'Epix Gen 2',
+            3944 => 'Epix Gen 2 APAC',
+            3949 => 'Venu 2S Asia',
+            3950 => 'Venu 2 Asia',
             3978 => 'Forerunner 945 LTE Asia',
             3982 => 'Vivomove Sport',
             3983 => 'Vivomove Trend',
+            3986 => 'Approach S12 Asia',
             3990 => 'Forerunner 255 Music',
             3991 => 'Forerunner 255S Music',
             3992 => 'Forerunner 255',
@@ -697,17 +823,20 @@ class phpFITFileAnalysis
             4001 => 'Approach G12 Asia',
             4002 => 'Approach S42 Asia',
             4005 => 'Descent G1',
+            4017 => 'Venu 2 Plus Asia',
             4024 => 'Forerunner 955',
             4033 => 'Forerunner 55 Asia',
             4061 => 'Edge 540',
             4062 => 'Edge 840',
             4063 => 'Vivosmart 5',
+            4071 => 'Instinct 2 Asia',
             4105 => 'MARQ Gen 2',
             4115 => 'Venu Sq 2',
             4116 => 'Venu Sq 2 Music',
             4124 => 'MARQ Gen 2 Aviator',
             4125 => 'D2 Air X10',
             4130 => 'HRM-Pro Plus',
+            4132 => 'Descent G1 Asia',
             4135 => 'Tactix 7',
             4155 => 'Instinct Crossover',
             4169 => 'Edge Explore 2',
@@ -718,6 +847,18 @@ class phpFITFileAnalysis
             4258 => 'Forerunner 265S',
             4260 => 'Venu 3',
             4261 => 'Venu 3S',
+            4265 => 'Tacx Neo Smart',
+            4266 => 'Tacx Neo 2 Smart',
+            4267 => 'Tacx Neo 2T Smart',
+            4268 => 'Tacx Neo Smart Bike',
+            4269 => 'Tacx Satori Smart',
+            4270 => 'Tacx Flow Smart',
+            4271 => 'Tacx Vortex Smart',
+            4272 => 'Tacx Bushido Smart',
+            4273 => 'Tacx Genius Smart',
+            4274 => 'Tacx Flux/Flux S Smart',
+            4275 => 'Tacx Flux 2 Smart',
+            4276 => 'Tacx Magnum',
             4305 => 'Edge 1040 Asia',
             4312 => 'Epix Gen 2 Pro 42mm',
             4313 => 'Epix Gen 2 Pro 47mm',
@@ -743,6 +884,9 @@ class phpFITFileAnalysis
             4534 => 'Fenix 8 43mm',
             4536 => 'Fenix 8 47mm',
             4556 => 'D2 Mach 1 Pro',
+            4565 => 'Forerunner 970',
+            4570 => 'Forerunner 570 47mm',
+            4574 => 'Forerunner 570 42mm',
             4575 => 'Enduro 3',
             4583 => 'Instinct E 40mm',
             4584 => 'Instinct E 45mm',
@@ -750,6 +894,8 @@ class phpFITFileAnalysis
             4586 => 'Instinct 3 AMOLED 45mm',
             4587 => 'Instinct 3 AMOLED 50mm',
             4588 => 'Descent G2',
+            4595 => 'Fenix 7 Pro Solar No Wi-Fi',
+            4603 => 'Venu X1',
             4606 => 'HRM-200',
             4625 => 'Vivoactive 6',
             4631 => 'Fenix 8 Pro',
@@ -766,12 +912,39 @@ class phpFITFileAnalysis
             4759 => 'Instinct 3 Solar 50mm',
             4775 => 'Tactix 8 AMOLED',
             4776 => 'Tactix 8 Solar',
+            4814 => 'Forerunner 170 Music',
+            4815 => 'Forerunner 170',
+            4825 => 'Approach J1',
+            4874 => 'Approach S72 43mm',
+            4875 => 'Approach S72 47mm',
             4879 => 'D2 Mach 2',
+            4916 => 'Forerunner 70 (2026)',
             4944 => 'D2 Air X15',
+            4952 => 'Fenix 9 Pro 43mm',
+            4953 => 'Fenix 9 Pro 47mm',
+            4954 => 'Fenix 9 Pro 51mm',
+            4955 => 'Fenix 9 Pro Solar 47mm',
+            4956 => 'Fenix 9 Pro Solar 51mm',
+            5019 => 'Cirqa Smart Band',
+            5056 => 'D2 Mach 2 Pro',
+            5133 => 'Fenix 9 43mm',
+            5134 => 'Fenix 9',                  // 47mm & 57mm
+            5169 => 'Enduro 4',
 
             10007 => 'SDM4 footpod',            // sdm4
             10014 => 'edge_remote',
             20119 => 'training_center',
+            20533 => 'Tacx Training App Windows',
+            20534 => 'Tacx Training App Mac',
+            20565 => 'Tacx Training App Mac Catalyst',
+            30045 => 'Tacx Training App Android',
+            30046 => 'Tacx Training App iOS',
+            30047 => 'Tacx Training App Legacy',
+            30059 => 'TrainingPeaks Virtual iOS',
+            30060 => 'TrainingPeaks Virtual Android',
+            30061 => 'TrainingPeaks Virtual Windows',
+            30062 => 'TrainingPeaks Virtual macOS',
+            30063 => 'TrainingPeaks Virtual Apple TV',
             65531 => 'connectiq_simulator',
             65532 => 'android_antplus_plugin',
             65534 => 'Garmin Connect website'   // connect
@@ -801,7 +974,7 @@ class phpFITFileAnalysis
             21 => 'E-Biking',
             22 => 'Motorcycling',
             23 => 'Boating',
-            24 => 'Diving',
+            24 => 'Driving',  // was 'Diving' (53 is diving); the FIT SDK value is 'driving'
             25 => 'Golf',
             26 => 'Hang gliding',
             27 => 'Horseback riding',
@@ -945,598 +1118,117 @@ class phpFITFileAnalysis
      * D00001275 Flexible & Interoperable Data Transfer (FIT) Protocol Rev 2.2.pdf
      * Table 4-6. FIT Base Types and Invalid Values
      *
-     * $types array holds a string used by the PHP unpack() function to format binary data.
-     * 'tmp' is the name of the (single element) array created.
+     * Per base type: its size, the unpack() code for little- and big-endian data, the bit width a
+     * signed type is sign-extended from, and its invalid value as unpacked. Integers are unpacked
+     * unsigned and sign-extended afterwards, before any scale or offset, so the invalid value is
+     * compared unsigned. 64-bit codes unpack to PHP's signed int, so uint64's all-ones is -1; a
+     * float's all-ones unpacks to NaN, so any NaN is invalid ('float'). Strings (0x07) are handled
+     * apart, and byte (0x0D) arrays are invalid only when every byte is 0xFF.
      */
-    private $endianness = [
-        0 => [  // Little Endianness
-            0   => ['format' => 'Ctmp', 'bytes' => 1],  // enum
-            1   => ['format' => 'ctmp', 'bytes' => 1],  // sint8
-            2   => ['format' => 'Ctmp', 'bytes' => 1],  // uint8
-            131 => ['format' => 'vtmp', 'bytes' => 2],  // sint16 - manually convert uint16 to sint16 in fixData()
-            132 => ['format' => 'vtmp', 'bytes' => 2],  // uint16
-            133 => ['format' => 'Vtmp', 'bytes' => 4],  // sint32 - manually convert uint32 to sint32 in fixData()
-            134 => ['format' => 'Vtmp', 'bytes' => 4],  // uint32
-            7   => ['format' => 'a*tmp', 'bytes' => 1], // string
-            136 => ['format' => 'ftmp', 'bytes' => 4],  // float32
-            137 => ['format' => 'dtmp', 'bytes' => 8],  // float64
-            10  => ['format' => 'Ctmp', 'bytes' => 1],  // uint8z
-            139 => ['format' => 'vtmp', 'bytes' => 2],  // uint16z
-            140 => ['format' => 'Vtmp', 'bytes' => 4],  // uint32z
-            13  => ['format' => 'Ctmp', 'bytes' => 1],  // byte
-            142 => ['format' => 'Ptmp', 'bytes' => 8],  // sint64 - manually convert uint64 to sint64 in fixData()
-            143 => ['format' => 'Ptmp', 'bytes' => 8],  // uint64
-            144 => ['format' => 'Ptmp', 'bytes' => 8]   // uint64z
-        ],
-        1 => [  // Big Endianness
-            0   => ['format' => 'Ctmp', 'bytes' => 1],  // enum
-            1   => ['format' => 'ctmp', 'bytes' => 1],  // sint8
-            2   => ['format' => 'Ctmp', 'bytes' => 1],  // uint8
-            131 => ['format' => 'ntmp', 'bytes' => 2],  // sint16 - manually convert uint16 to sint16 in fixData()
-            132 => ['format' => 'ntmp', 'bytes' => 2],  // uint16
-            133 => ['format' => 'Ntmp', 'bytes' => 4],  // sint32 - manually convert uint32 to sint32 in fixData()
-            134 => ['format' => 'Ntmp', 'bytes' => 4],  // uint32
-            7   => ['format' => 'a*tmp', 'bytes' => 1], // string
-            136 => ['format' => 'ftmp', 'bytes' => 4],  // float32
-            137 => ['format' => 'dtmp', 'bytes' => 8],  // float64
-            10  => ['format' => 'Ctmp', 'bytes' => 1],  // uint8z
-            139 => ['format' => 'ntmp', 'bytes' => 2],  // uint16z
-            140 => ['format' => 'Ntmp', 'bytes' => 4],  // uint32z
-            13  => ['format' => 'Ctmp', 'bytes' => 1],  // byte
-            142 => ['format' => 'Jtmp', 'bytes' => 8],  // sint64 - manually convert uint64 to sint64 in fixData()
-            143 => ['format' => 'Jtmp', 'bytes' => 8],  // uint64
-            144 => ['format' => 'Jtmp', 'bytes' => 8]   // uint64z
-        ]
+    private const BASE_TYPES = [
+        0x00 => ['bytes' => 1, 'le' => 'C', 'be' => 'C', 'sign_bits' => 0,  'invalid' => 0xFF],                // enum
+        0x01 => ['bytes' => 1, 'le' => 'C', 'be' => 'C', 'sign_bits' => 8,  'invalid' => 0x7F],                // sint8
+        0x02 => ['bytes' => 1, 'le' => 'C', 'be' => 'C', 'sign_bits' => 0,  'invalid' => 0xFF],                // uint8
+        0x83 => ['bytes' => 2, 'le' => 'v', 'be' => 'n', 'sign_bits' => 16, 'invalid' => 0x7FFF],              // sint16
+        0x84 => ['bytes' => 2, 'le' => 'v', 'be' => 'n', 'sign_bits' => 0,  'invalid' => 0xFFFF],              // uint16
+        0x85 => ['bytes' => 4, 'le' => 'V', 'be' => 'N', 'sign_bits' => 32, 'invalid' => 0x7FFFFFFF],          // sint32
+        0x86 => ['bytes' => 4, 'le' => 'V', 'be' => 'N', 'sign_bits' => 0,  'invalid' => 0xFFFFFFFF],          // uint32
+        0x88 => ['bytes' => 4, 'le' => 'g', 'be' => 'G', 'sign_bits' => 0,  'float' => true],  // float32
+        0x89 => ['bytes' => 8, 'le' => 'e', 'be' => 'E', 'sign_bits' => 0,  'float' => true],  // float64
+        0x0A => ['bytes' => 1, 'le' => 'C', 'be' => 'C', 'sign_bits' => 0,  'invalid' => 0],                   // uint8z
+        0x8B => ['bytes' => 2, 'le' => 'v', 'be' => 'n', 'sign_bits' => 0,  'invalid' => 0],                   // uint16z
+        0x8C => ['bytes' => 4, 'le' => 'V', 'be' => 'N', 'sign_bits' => 0,  'invalid' => 0],                   // uint32z
+        0x0D => ['bytes' => 1, 'le' => 'C', 'be' => 'C', 'sign_bits' => 0,  'invalid' => 0xFF],                // byte
+        0x8E => ['bytes' => 8, 'le' => 'P', 'be' => 'J', 'sign_bits' => 0,  'invalid' => PHP_INT_MAX],         // sint64 (unpacks signed already)
+        0x8F => ['bytes' => 8, 'le' => 'P', 'be' => 'J', 'sign_bits' => 0,  'invalid' => -1],                  // uint64
+        0x90 => ['bytes' => 8, 'le' => 'P', 'be' => 'J', 'sign_bits' => 0,  'invalid' => 0],                   // uint64z
     ];
+    // Manufacturers whose product numbers are garmin_product values (FIT SDK subfield map):
+    // garmin, dynastream, dynastream_oem, tacx.
+    private const GARMIN_PRODUCT_MANUFACTURERS = [1, 15, 13, 89];
 
-    private $invalid_values = [
-        0   => 255,                  // 0xFF
-        1   => 127,                  // 0x7F
-        2   => 255,                  // 0xFF
-        131 => 32767,                // 0x7FFF
-        132 => 65535,                // 0xFFFF
-        133 => 2147483647,           // 0x7FFFFFFF
-        134 => 4294967295,           // 0xFFFFFFFF
-        7   => 0,                    // 0x00
-        136 => 4294967295,           // 0xFFFFFFFF
-        137 => 9223372036854775807,  // 0xFFFFFFFFFFFFFFFF
-        10  => 0,                    // 0x00
-        139 => 0,                    // 0x0000
-        140 => 0,                    // 0x00000000
-        13  => 255,                  // 0xFF
-        142 => 9223372036854775807,  // 0x7FFFFFFFFFFFFFFF
-        143 => 18446744073709551615, // 0xFFFFFFFFFFFFFFFF
-        144 => 0                     // 0x0000000000000000
+    // enumData() type names that differ from the FIT SDK's, and the types whose SDK names it
+    // capitalises with spaces for underscores, as $enum_data does for them.
+    private const ENUM_TYPE_ALIASES = ['product' => 'garmin_product'];
+    private const CAPITALISED_ENUM_TYPES = ['sport', 'sub_sport'];
+    // APP-2016: single-byte ANT+ sensor product IDs, left 'unknown' rather than named from the SDK.
+    // They are Suunto, Polar and Wahoo watches too, which athletica-app names only when this
+    // returns 'unknown' (see the comment on $enum_data['product']).
+    private const UNNAMED_PRODUCT_IDS = [13, 15, 16, 22];
+
+    private const BASE_TYPE_STRING = 0x07;
+    private const BASE_TYPE_BYTE = 0x0D;
+    private const BASE_TYPE_UINT64 = 0x8F;
+    private const BASE_TYPE_UINT64Z = 0x90;
+
+    // Every other message's field lists hold one entry per message, null where a message has no
+    // valid value (APP-1788 for laps; any message had the same misalignment otherwise). Records are
+    // keyed by timestamp instead, and hr arrays are decoded together by processHrMessages().
+    private const UNPADDED_MESSAGES = ['record', 'hr'];
+
+    // Session fields present on every session even when no session carries a valid value; callers
+    // read these without isset() (they were the only session fields padded before).
+    private const ALWAYS_PRESENT_SESSION_FIELDS = [
+        'avg_heart_rate', 'max_heart_rate', 'avg_power', 'max_power', 'normalized_power', 'total_work', 'total_cycles',
+        'avg_cadence', 'max_cadence', 'avg_fractional_cadence', 'max_fractional_cadence', 'training_stress_score',
+        'intensity_factor', 'threshold_power', 'time_in_hr_zone', 'total_training_effect', 'total_ascent', 'total_descent',
     ];
 
     /**
-     * D00001275 Flexible & Interoperable Data Transfer (FIT) Protocol Rev 1.7.pdf
-     * 4.4 Scale/Offset
-     * When specified, the binary quantity is divided by the scale factor and then the offset is subtracted, yielding a floating point quantity.
+     * Messages and fields, by global message number: the FIT SDK profile (Profile::MESSAGES,
+     * generated by bin/generate-profile.php) with FIELD_OVERRIDES applied. See messageInfo().
      */
-    private $data_mesg_info = [
-        0 => [
-            'mesg_name' => 'file_id', 'field_defns' => [
-                0 => ['field_name' => 'type',           'scale' => 1, 'offset' => 0, 'units' => ''],
-                1 => ['field_name' => 'manufacturer',   'scale' => 1, 'offset' => 0, 'units' => ''],
-                2 => ['field_name' => 'product',        'scale' => 1, 'offset' => 0, 'units' => ''],
-                3 => ['field_name' => 'serial_number',  'scale' => 1, 'offset' => 0, 'units' => ''],
-                4 => ['field_name' => 'time_created',   'scale' => 1, 'offset' => 0, 'units' => ''],
-                5 => ['field_name' => 'number',         'scale' => 1, 'offset' => 0, 'units' => ''],
-            ]
+    private array $data_mesg_info = [];
+
+    /**
+     * Where this library deliberately departs from the FIT SDK profile, per message and field
+     * number: a field kept raw for code that decodes it by hand. (Session 192/193, once returned as
+     * 'feel' and 'rpe' at 1/10th scale, are now only the SDK's workout_feel and workout_rpe.)
+     */
+    private const FIELD_OVERRIDES = [
+        132 => [  // hr: processHrMessages() decodes these in 1/1024 s itself
+            9 => ['scale' => 1],                       // event_timestamp
+            10 => ['scale' => 1, 'components' => []],  // event_timestamp_12
         ],
-
-        2 => [
-            'mesg_name' => 'device_settings', 'field_defns' => [
-                0 => ['field_name' => 'active_time_zone', 'scale' => 1, 'offset' => 0, 'units' => ''],
-                1 => ['field_name' => 'utc_offset', 'scale' => 1, 'offset' => 0, 'units' => ''],
-                5 => ['field_name' => 'time_zone_offset', 'scale' => 4, 'offset' => 0, 'units' => 'hr'],
-            ]
-        ],
-
-        3 => [
-            'mesg_name' => 'user_profile', 'field_defns' => [
-                0 => ['field_name' => 'friendly_name',                  'scale' => 1,   'offset' => 0, 'units' => ''],
-                1 => ['field_name' => 'gender',                         'scale' => 1,   'offset' => 0, 'units' => ''],
-                2 => ['field_name' => 'age',                            'scale' => 1,   'offset' => 0, 'units' => 'years'],
-                3 => ['field_name' => 'height',                         'scale' => 100, 'offset' => 0, 'units' => 'm'],
-                4 => ['field_name' => 'weight',                         'scale' => 10,  'offset' => 0, 'units' => 'kg'],
-                5 => ['field_name' => 'language',                       'scale' => 1,   'offset' => 0, 'units' => ''],
-                6 => ['field_name' => 'elev_setting',                   'scale' => 1,   'offset' => 0, 'units' => ''],
-                7 => ['field_name' => 'weight_setting',                 'scale' => 1,   'offset' => 0, 'units' => ''],
-                8 => ['field_name' => 'resting_heart_rate',             'scale' => 1,   'offset' => 0, 'units' => 'bpm'],
-                10 => ['field_name' => 'default_max_biking_heart_rate', 'scale' => 1,   'offset' => 0, 'units' => 'bpm'],
-                11 => ['field_name' => 'default_max_heart_rate',        'scale' => 1,   'offset' => 0, 'units' => 'bpm'],
-                12 => ['field_name' => 'hr_setting',                    'scale' => 1,   'offset' => 0, 'units' => ''],
-                13 => ['field_name' => 'speed_setting',                 'scale' => 1,   'offset' => 0, 'units' => ''],
-                14 => ['field_name' => 'dist_setting',                  'scale' => 1,   'offset' => 0, 'units' => ''],
-                16 => ['field_name' => 'power_setting',                 'scale' => 1,   'offset' => 0, 'units' => ''],
-                17 => ['field_name' => 'activity_class',                'scale' => 1,   'offset' => 0, 'units' => ''],
-                18 => ['field_name' => 'position_setting',              'scale' => 1,   'offset' => 0, 'units' => ''],
-                21 => ['field_name' => 'temperature_setting',           'scale' => 1,   'offset' => 0, 'units' => ''],
-            ]
-        ],
-
-        7 => [
-            'mesg_name' => 'zones_target', 'field_defns' => [
-                1 => ['field_name' => 'max_heart_rate',             'scale' => 1, 'offset' => 0, 'units' => ''],
-                2 => ['field_name' => 'threshold_heart_rate',       'scale' => 1, 'offset' => 0, 'units' => ''],
-                3 => ['field_name' => 'functional_threshold_power', 'scale' => 1, 'offset' => 0, 'units' => ''],
-                5 => ['field_name' => 'hr_calc_type',               'scale' => 1, 'offset' => 0, 'units' => ''],
-                7 => ['field_name' => 'pwr_calc_type',              'scale' => 1, 'offset' => 0, 'units' => ''],
-            ]
-        ],
-
-        12 => [
-            'mesg_name' => 'sport', 'field_defns' => [
-                0 => ['field_name' => 'sport',     'scale' => 1, 'offset' => 0, 'units' => ''],
-                1 => ['field_name' => 'sub_sport', 'scale' => 1, 'offset' => 0, 'units' => ''],
-                3 => ['field_name' => 'name',      'scale' => 1, 'offset' => 0, 'units' => ''],
-            ]
-        ],
-
-        18 => [
-            'mesg_name' => 'session', 'field_defns' => [
-                0 => ['field_name' => 'event',                            'scale' => 1,         'offset' => 0, 'units' => ''],
-                1 => ['field_name' => 'event_type',                       'scale' => 1,         'offset' => 0, 'units' => ''],
-                2 => ['field_name' => 'start_time',                       'scale' => 1,         'offset' => 0, 'units' => ''],
-                3 => ['field_name' => 'start_position_lat',               'scale' => 1,         'offset' => 0, 'units' => 'semicircles'],
-                4 => ['field_name' => 'start_position_long',              'scale' => 1,         'offset' => 0, 'units' => 'semicircles'],
-                5 => ['field_name' => 'sport',                            'scale' => 1,         'offset' => 0, 'units' => 'semicircles'],
-                6 => ['field_name' => 'sub_sport',                        'scale' => 1,         'offset' => 0, 'units' => ''],
-                7 => ['field_name' => 'total_elapsed_time',               'scale' => 1000,      'offset' => 0, 'units' => 's'],
-                8 => ['field_name' => 'total_timer_time',                 'scale' => 1000,      'offset' => 0, 'units' => 's'],
-                9 => ['field_name' => 'total_distance',                   'scale' => 100,       'offset' => 0, 'units' => 'm'],
-                10 => ['field_name' => 'total_cycles',                    'scale' => 1,         'offset' => 0, 'units' => 'cycles'],
-                11 => ['field_name' => 'total_calories',                  'scale' => 1,         'offset' => 0, 'units' => 'kcal'],
-                13 => ['field_name' => 'total_fat_calories',              'scale' => 1,         'offset' => 0, 'units' => 'kcal'],
-                14 => ['field_name' => 'avg_speed',                       'scale' => 1000,      'offset' => 0, 'units' => 'm/s'],
-                15 => ['field_name' => 'max_speed',                       'scale' => 1000,      'offset' => 0, 'units' => 'm/s'],
-                16 => ['field_name' => 'avg_heart_rate',                  'scale' => 1,         'offset' => 0, 'units' => 'bpm'],
-                17 => ['field_name' => 'max_heart_rate',                  'scale' => 1,         'offset' => 0, 'units' => 'bpm'],
-                18 => ['field_name' => 'avg_cadence',                     'scale' => 1,         'offset' => 0, 'units' => 'rpm'],
-                19 => ['field_name' => 'max_cadence',                     'scale' => 1,         'offset' => 0, 'units' => 'rpm'],
-                20 => ['field_name' => 'avg_power',                       'scale' => 1,         'offset' => 0, 'units' => 'watts'],
-                21 => ['field_name' => 'max_power',                       'scale' => 1,         'offset' => 0, 'units' => 'watts'],
-                22 => ['field_name' => 'total_ascent',                    'scale' => 1,         'offset' => 0, 'units' => 'm'],
-                23 => ['field_name' => 'total_descent',                   'scale' => 1,         'offset' => 0, 'units' => 'm'],
-                24 => ['field_name' => 'total_training_effect',           'scale' => 10,        'offset' => 0, 'units' => ''],
-                25 => ['field_name' => 'first_lap_index',                 'scale' => 1,         'offset' => 0, 'units' => ''],
-                26 => ['field_name' => 'num_laps',                        'scale' => 1,         'offset' => 0, 'units' => ''],
-                27 => ['field_name' => 'event_group',                     'scale' => 1,         'offset' => 0, 'units' => ''],
-                28 => ['field_name' => 'trigger',                         'scale' => 1,         'offset' => 0, 'units' => ''],
-                29 => ['field_name' => 'nec_lat',                         'scale' => 1,         'offset' => 0, 'units' => 'semicircles'],
-                30 => ['field_name' => 'nec_long',                        'scale' => 1,         'offset' => 0, 'units' => 'semicircles'],
-                31 => ['field_name' => 'swc_lat',                         'scale' => 1,         'offset' => 0, 'units' => 'semicircles'],
-                32 => ['field_name' => 'swc_long',                        'scale' => 1,         'offset' => 0, 'units' => 'semicircles'],
-                34 => ['field_name' => 'normalized_power',                'scale' => 1,         'offset' => 0, 'units' => 'watts'],
-                35 => ['field_name' => 'training_stress_score',           'scale' => 10,        'offset' => 0, 'units' => 'tss'],
-                36 => ['field_name' => 'intensity_factor',                'scale' => 1000,      'offset' => 0, 'units' => 'if'],
-                37 => ['field_name' => 'left_right_balance',              'scale' => 1,         'offset' => 0, 'units' => ''],
-                41 => ['field_name' => 'avg_stroke_count',                'scale' => 10,        'offset' => 0, 'units' => 'strokes/lap'],
-                42 => ['field_name' => 'avg_stroke_distance',             'scale' => 100,       'offset' => 0, 'units' => 'm'],
-                43 => ['field_name' => 'swim_stroke',                     'scale' => 1,         'offset' => 0, 'units' => 'swim_stroke'],
-                44 => ['field_name' => 'pool_length',                     'scale' => 100,       'offset' => 0, 'units' => 'm'],
-                45 => ['field_name' => 'threshold_power',                 'scale' => 1,         'offset' => 0, 'units' => 'watts'],
-                46 => ['field_name' => 'pool_length_unit',                'scale' => 1,         'offset' => 0, 'units' => ''],
-                47 => ['field_name' => 'num_active_lengths',              'scale' => 1,         'offset' => 0, 'units' => 'lengths'],
-                48 => ['field_name' => 'total_work',                      'scale' => 1,         'offset' => 0, 'units' => 'J'],
-                65 => ['field_name' => 'time_in_hr_zone',                 'scale' => 1000,      'offset' => 0, 'units' => 's'],
-                68 => ['field_name' => 'time_in_power_zone',              'scale' => 1000,      'offset' => 0, 'units' => 's'],
-                89 => ['field_name' => 'avg_vertical_oscillation',        'scale' => 10,        'offset' => 0, 'units' => 'mm'],
-                90 => ['field_name' => 'avg_stance_time_percent',         'scale' => 100,       'offset' => 0, 'units' => 'percent'],
-                91 => ['field_name' => 'avg_stance_time',                 'scale' => 10,        'offset' => 0, 'units' => 'ms'],
-                92 => ['field_name' => 'avg_fractional_cadence',          'scale' => 128,       'offset' => 0, 'units' => 'rpm'],
-                93 => ['field_name' => 'max_fractional_cadence',          'scale' => 128,       'offset' => 0, 'units' => 'rpm'],
-                94 => ['field_name' => 'total_fractional_cycles',         'scale' => 128,       'offset' => 0, 'units' => 'cycles'],
-                101 => ['field_name' => 'avg_left_torque_effectiveness',  'scale' => 2,         'offset' => 0, 'units' => 'percent'],
-                102 => ['field_name' => 'avg_right_torque_effectiveness', 'scale' => 2,         'offset' => 0, 'units' => 'percent'],
-                103 => ['field_name' => 'avg_left_pedal_smoothness',      'scale' => 2,         'offset' => 0, 'units' => 'percent'],
-                104 => ['field_name' => 'avg_right_pedal_smoothness',     'scale' => 2,         'offset' => 0, 'units' => 'percent'],
-                105 => ['field_name' => 'avg_combined_pedal_smoothness',  'scale' => 2,         'offset' => 0, 'units' => 'percent'],
-                111 => ['field_name' => 'sport_index',                    'scale' => 1,         'offset' => 0, 'units' => ''],
-                112 => ['field_name' => 'time_standing',                  'scale' => 1000,      'offset' => 0, 'units' => 's'],
-                113 => ['field_name' => 'stand_count',                    'scale' => 1,         'offset' => 0, 'units' => ''],
-                114 => ['field_name' => 'avg_left_pco',                   'scale' => 1,         'offset' => 0, 'units' => 'mm'],
-                115 => ['field_name' => 'avg_right_pco',                  'scale' => 1,         'offset' => 0, 'units' => 'mm'],
-                116 => ['field_name' => 'avg_left_power_phase',           'scale' => 0.7111111, 'offset' => 0, 'units' => 'degrees'],
-                117 => ['field_name' => 'avg_left_power_phase_peak',      'scale' => 0.7111111, 'offset' => 0, 'units' => 'degrees'],
-                118 => ['field_name' => 'avg_right_power_phase',          'scale' => 0.7111111, 'offset' => 0, 'units' => 'degrees'],
-                119 => ['field_name' => 'avg_right_power_phase_peak',     'scale' => 0.7111111, 'offset' => 0, 'units' => 'degrees'],
-                120 => ['field_name' => 'avg_power_position',             'scale' => 1,         'offset' => 0, 'units' => 'watts'],
-                121 => ['field_name' => 'max_power_position',             'scale' => 1,         'offset' => 0, 'units' => 'watts'],
-                122 => ['field_name' => 'avg_cadence_position',           'scale' => 1,         'offset' => 0, 'units' => 'rpm'],
-                123 => ['field_name' => 'max_cadence_position',           'scale' => 1,         'offset' => 0, 'units' => 'rpm'],
-                253 => ['field_name' => 'timestamp',                      'scale' => 1,         'offset' => 0, 'units' => 's'],
-                254 => ['field_name' => 'message_index',                  'scale' => 1,         'offset' => 0, 'units' => ''],
-                192 => ['field_name' => 'feel',                           'scale' => 10,        'offset' => 0, 'units' => ''],
-                193 => ['field_name' => 'rpe',                            'scale' => 10,        'offset' => 0, 'units' => ''],
-            ]
-        ],
-
-        19 => [
-            'mesg_name' => 'lap', 'field_defns' => [
-                0 => ['field_name' => 'event',                           'scale' => 1,         'offset' => 0, 'units' => ''],
-                1 => ['field_name' => 'event_type',                      'scale' => 1,         'offset' => 0, 'units' => ''],
-                2 => ['field_name' => 'start_time',                      'scale' => 1,         'offset' => 0, 'units' => ''],
-                3 => ['field_name' => 'start_position_lat',              'scale' => 1,         'offset' => 0, 'units' => 'semicircles'],
-                4 => ['field_name' => 'start_position_long',             'scale' => 1,         'offset' => 0, 'units' => 'semicircles'],
-                5 => ['field_name' => 'end_position_lat',                'scale' => 1,         'offset' => 0, 'units' => 'semicircles'],
-                6 => ['field_name' => 'end_position_long',               'scale' => 1,         'offset' => 0, 'units' => 'semicircles'],
-                7 => ['field_name' => 'total_elapsed_time',              'scale' => 1000,      'offset' => 0, 'units' => 's'],
-                8 => ['field_name' => 'total_timer_time',                'scale' => 1000,      'offset' => 0, 'units' => 's'],
-                9 => ['field_name' => 'total_distance',                  'scale' => 100,       'offset' => 0, 'units' => 'm'],
-                10 => ['field_name' => 'total_cycles',                   'scale' => 1,         'offset' => 0, 'units' => 'cycles'],
-                11 => ['field_name' => 'total_calories',                 'scale' => 1,         'offset' => 0, 'units' => 'kcal'],
-                12 => ['field_name' => 'total_fat_calories',             'scale' => 1,         'offset' => 0, 'units' => 'kcal'],
-                13 => ['field_name' => 'avg_speed',                      'scale' => 1000,      'offset' => 0, 'units' => 'm/s'],
-                14 => ['field_name' => 'max_speed',                      'scale' => 1000,      'offset' => 0, 'units' => 'm/s'],
-                15 => ['field_name' => 'avg_heart_rate',                 'scale' => 1,         'offset' => 0, 'units' => 'bpm'],
-                16 => ['field_name' => 'max_heart_rate',                 'scale' => 1,         'offset' => 0, 'units' => 'bpm'],
-                17 => ['field_name' => 'avg_cadence',                    'scale' => 1,         'offset' => 0, 'units' => 'rpm'],
-                18 => ['field_name' => 'max_cadence',                    'scale' => 1,         'offset' => 0, 'units' => 'rpm'],
-                19 => ['field_name' => 'avg_power',                      'scale' => 1,         'offset' => 0, 'units' => 'watts'],
-                20 => ['field_name' => 'max_power',                      'scale' => 1,         'offset' => 0, 'units' => 'watts'],
-                21 => ['field_name' => 'total_ascent',                   'scale' => 1,         'offset' => 0, 'units' => 'm'],
-                22 => ['field_name' => 'total_descent',                  'scale' => 1,         'offset' => 0, 'units' => 'm'],
-                23 => ['field_name' => 'intensity',                      'scale' => 1,         'offset' => 0, 'units' => ''],
-                24 => ['field_name' => 'lap_trigger',                    'scale' => 1,         'offset' => 0, 'units' => ''],
-                25 => ['field_name' => 'sport',                          'scale' => 1,         'offset' => 0, 'units' => ''],
-                26 => ['field_name' => 'event_group',                    'scale' => 1,         'offset' => 0, 'units' => ''],
-                32 => ['field_name' => 'num_lengths',                    'scale' => 1,         'offset' => 0, 'units' => 'lengths'],
-                33 => ['field_name' => 'normalized_power',               'scale' => 1,         'offset' => 0, 'units' => 'watts'],
-                34 => ['field_name' => 'left_right_balance',             'scale' => 1,         'offset' => 0, 'units' => ''],
-                35 => ['field_name' => 'first_length_index',             'scale' => 1,         'offset' => 0, 'units' => ''],
-                37 => ['field_name' => 'avg_stroke_distance',            'scale' => 100,       'offset' => 0, 'units' => 'm'],
-                38 => ['field_name' => 'swim_stroke',                    'scale' => 1,         'offset' => 0, 'units' => ''],
-                39 => ['field_name' => 'sub_sport',                      'scale' => 1,         'offset' => 0, 'units' => ''],
-                40 => ['field_name' => 'num_active_lengths',             'scale' => 1,         'offset' => 0, 'units' => 'lengths'],
-                41 => ['field_name' => 'total_work',                     'scale' => 1,         'offset' => 0, 'units' => 'J'],
-                57 => ['field_name' => 'time_in_hr_zone',                'scale' => 1000,      'offset' => 0, 'units' => 's'],
-                60 => ['field_name' => 'time_in_power_zone',             'scale' => 1000,      'offset' => 0, 'units' => 's'],
-                71 => ['field_name' => 'wkt_step_index',                 'scale' => 1,         'offset' => 0, 'units' => ''],
-                77 => ['field_name' => 'avg_vertical_oscillation',       'scale' => 10,        'offset' => 0, 'units' => 'mm'],
-                78 => ['field_name' => 'avg_stance_time_percent',        'scale' => 100,       'offset' => 0, 'units' => 'percent'],
-                79 => ['field_name' => 'avg_stance_time',                'scale' => 10,        'offset' => 0, 'units' => 'ms'],
-                80 => ['field_name' => 'avg_fractional_cadence',         'scale' => 128,       'offset' => 0, 'units' => 'rpm'],
-                81 => ['field_name' => 'max_fractional_cadence',         'scale' => 128,       'offset' => 0, 'units' => 'rpm'],
-                82 => ['field_name' => 'total_fractional_cycles',        'scale' => 128,       'offset' => 0, 'units' => 'cycles'],
-                91 => ['field_name' => 'avg_left_torque_effectiveness',  'scale' => 2,         'offset' => 0, 'units' => 'percent'],
-                92 => ['field_name' => 'avg_right_torque_effectiveness', 'scale' => 2,         'offset' => 0, 'units' => 'percent'],
-                93 => ['field_name' => 'avg_left_pedal_smoothness',      'scale' => 2,         'offset' => 0, 'units' => 'percent'],
-                94 => ['field_name' => 'avg_right_pedal_smoothness',     'scale' => 2,         'offset' => 0, 'units' => 'percent'],
-                95 => ['field_name' => 'avg_combined_pedal_smoothness',  'scale' => 2,         'offset' => 0, 'units' => 'percent'],
-                98 => ['field_name' => 'time_standing',                  'scale' => 1000,      'offset' => 0, 'units' => 's'],
-                99 => ['field_name' => 'stand_count',                    'scale' => 1,         'offset' => 0, 'units' => ''],
-                100 => ['field_name' => 'avg_left_pco',                  'scale' => 1,         'offset' => 0, 'units' => 'mm'],
-                101 => ['field_name' => 'avg_right_pco',                 'scale' => 1,         'offset' => 0, 'units' => 'mm'],
-                102 => ['field_name' => 'avg_left_power_phase',          'scale' => 0.7111111, 'offset' => 0, 'units' => 'degrees'],
-                103 => ['field_name' => 'avg_left_power_phase_peak',     'scale' => 0.7111111, 'offset' => 0, 'units' => 'degrees'],
-                104 => ['field_name' => 'avg_right_power_phase',         'scale' => 0.7111111, 'offset' => 0, 'units' => 'degrees'],
-                105 => ['field_name' => 'avg_right_power_phase_peak',    'scale' => 0.7111111, 'offset' => 0, 'units' => 'degrees'],
-                106 => ['field_name' => 'avg_power_position',            'scale' => 1,         'offset' => 0, 'units' => 'watts'],
-                107 => ['field_name' => 'max_power_position',            'scale' => 1,         'offset' => 0, 'units' => 'watts'],
-                108 => ['field_name' => 'avg_cadence_position',          'scale' => 1,         'offset' => 0, 'units' => 'rpm'],
-                109 => ['field_name' => 'max_cadence_position',          'scale' => 1,         'offset' => 0, 'units' => 'rpm'],
-                110 => ['field_name' => 'enhanced_avg_speed',             'scale' => 1000,      'offset' => 0, 'units' => 'm/s'],
-                111 => ['field_name' => 'enhanced_max_speed',             'scale' => 1000,      'offset' => 0, 'units' => 'm/s'],
-                253 => ['field_name' => 'timestamp',                     'scale' => 1,         'offset' => 0, 'units' => 's'],
-                254 => ['field_name' => 'message_index',                 'scale' => 1,         'offset' => 0, 'units' => '']
-            ]
-        ],
-
-        20 => [
-            'mesg_name' => 'record', 'field_defns' => [
-                0 => ['field_name' => 'position_lat',                      'scale' => 1,         'offset' => 0,   'units' => 'semicircles'],
-                1 => ['field_name' => 'position_long',                     'scale' => 1,         'offset' => 0,   'units' => 'semicircles'],
-                2 => ['field_name' => 'altitude',                          'scale' => 5,         'offset' => 500, 'units' => 'm'],
-                3 => ['field_name' => 'heart_rate',                        'scale' => 1,         'offset' => 0,   'units' => 'bpm'],
-                4 => ['field_name' => 'cadence',                           'scale' => 1,         'offset' => 0,   'units' => 'rpm'],
-                5 => ['field_name' => 'distance',                          'scale' => 100,       'offset' => 0,   'units' => 'm'],
-                6 => ['field_name' => 'speed',                             'scale' => 1000,      'offset' => 0,   'units' => 'm/s'],
-                7 => ['field_name' => 'power',                             'scale' => 1,         'offset' => 0,   'units' => 'watts'],
-                8 => ['field_name' => 'compressed_speed_distance',         'scale' => 100,       'offset' => 0,   'units' => 'm/s,m'],
-                9 => ['field_name' => 'grade',                             'scale' => 100,       'offset' => 0,   'units' => 'percent'],
-                10 => ['field_name' => 'resistance',                       'scale' => 1,         'offset' => 0,   'units' => ''],
-                11 => ['field_name' => 'time_from_course',                 'scale' => 1000,      'offset' => 0,   'units' => 's'],
-                12 => ['field_name' => 'cycle_length',                     'scale' => 100,       'offset' => 0,   'units' => 'm'],
-                13 => ['field_name' => 'temperature',                      'scale' => 1,         'offset' => 0,   'units' => 'C'],
-                17 => ['field_name' => 'speed_1s',                         'scale' => 16,        'offset' => 0,   'units' => 'm/s'],
-                18 => ['field_name' => 'cycles',                           'scale' => 1,         'offset' => 0,   'units' => 'cycles'],
-                19 => ['field_name' => 'total_cycles',                     'scale' => 1,         'offset' => 0,   'units' => 'cycles'],
-                28 => ['field_name' => 'compressed_accumulated_power',     'scale' => 1,         'offset' => 0,   'units' => 'watts'],
-                29 => ['field_name' => 'accumulated_power',                'scale' => 1,         'offset' => 0,   'units' => 'watts'],
-                30 => ['field_name' => 'left_right_balance',               'scale' => 1,         'offset' => 0,   'units' => ''],
-                31 => ['field_name' => 'gps_accuracy',                     'scale' => 1,         'offset' => 0,   'units' => 'm'],
-                32 => ['field_name' => 'vertical_speed',                   'scale' => 1000,      'offset' => 0,   'units' => 'm/s'],
-                33 => ['field_name' => 'calories',                         'scale' => 1,         'offset' => 0,   'units' => 'kcal'],
-                39 => ['field_name' => 'vertical_oscillation',             'scale' => 10,        'offset' => 0,   'units' => 'mm'],
-                40 => ['field_name' => 'stance_time_percent',              'scale' => 100,       'offset' => 0,   'units' => 'percent'],
-                41 => ['field_name' => 'stance_time',                      'scale' => 10,        'offset' => 0,   'units' => 'ms'],
-                42 => ['field_name' => 'activity_type',                    'scale' => 1,         'offset' => 0,   'units' => ''],
-                43 => ['field_name' => 'left_torque_effectiveness',        'scale' => 2,         'offset' => 0,   'units' => 'percent'],
-                44 => ['field_name' => 'right_torque_effectiveness',       'scale' => 2,         'offset' => 0,   'units' => 'percent'],
-                45 => ['field_name' => 'left_pedal_smoothness',            'scale' => 2,         'offset' => 0,   'units' => 'percent'],
-                46 => ['field_name' => 'right_pedal_smoothness',           'scale' => 2,         'offset' => 0,   'units' => 'percent'],
-                47 => ['field_name' => 'combined_pedal_smoothness',        'scale' => 2,         'offset' => 0,   'units' => 'percent'],
-                48 => ['field_name' => 'time128',                          'scale' => 128,       'offset' => 0,   'units' => 's'],
-                49 => ['field_name' => 'stroke_type',                      'scale' => 1,         'offset' => 0,   'units' => ''],
-                50 => ['field_name' => 'zone',                             'scale' => 1,         'offset' => 0,   'units' => ''],
-                51 => ['field_name' => 'ball_speed',                       'scale' => 100,       'offset' => 0,   'units' => 'm/s'],
-                52 => ['field_name' => 'cadence256',                       'scale' => 256,       'offset' => 0,   'units' => 'rpm'],
-                53 => ['field_name' => 'fractional_cadence',               'scale' => 128,       'offset' => 0,   'units' => 'rpm'],
-                54 => ['field_name' => 'total_hemoglobin_conc',            'scale' => 100,       'offset' => 0,   'units' => 'g/dL'],
-                55 => ['field_name' => 'total_hemoglobin_conc_min',        'scale' => 100,       'offset' => 0,   'units' => 'g/dL'],
-                56 => ['field_name' => 'total_hemoglobin_conc_max',        'scale' => 100,       'offset' => 0,   'units' => 'g/dL'],
-                57 => ['field_name' => 'saturated_hemoglobin_percent',     'scale' => 10,        'offset' => 0,   'units' => '%'],
-                58 => ['field_name' => 'saturated_hemoglobin_percent_min', 'scale' => 10,        'offset' => 0,   'units' => '%'],
-                59 => ['field_name' => 'saturated_hemoglobin_percent_max', 'scale' => 10,        'offset' => 0,   'units' => '%'],
-                62 => ['field_name' => 'device_index',                     'scale' => 1,         'offset' => 0,   'units' => ''],
-                67 => ['field_name' => 'left_pco',                         'scale' => 1,         'offset' => 0,   'units' => 'mm'],
-                68 => ['field_name' => 'right_pco',                        'scale' => 1,         'offset' => 0,   'units' => 'mm'],
-                69 => ['field_name' => 'left_power_phase',                 'scale' => 0.7111111, 'offset' => 0,   'units' => 'degrees'],
-                70 => ['field_name' => 'left_power_phase_peak',            'scale' => 0.7111111, 'offset' => 0,   'units' => 'degrees'],
-                71 => ['field_name' => 'right_power_phase',                'scale' => 0.7111111, 'offset' => 0,   'units' => 'degrees'],
-                72 => ['field_name' => 'right_power_phase_peak',           'scale' => 0.7111111, 'offset' => 0,   'units' => 'degrees'],
-                73 => ['field_name' => 'enhanced_speed',                   'scale' => 1000,      'offset' => 0,   'units' => 'm/s'],
-                78 => ['field_name' => 'enhanced_altitude',                'scale' => 5,         'offset' => 500, 'units' => 'm'],
-                81 => ['field_name' => 'battery_soc',                      'scale' => 2,         'offset' => 0,   'units' => 'percent'],
-                82 => ['field_name' => 'motor_power',                      'scale' => 1,         'offset' => 0,   'units' => 'watts'],
-                83 => ['field_name' => 'vertical_ratio',                   'scale' => 100,       'offset' => 0,   'units' => 'percent'],
-                84 => ['field_name' => 'stance_time_balance',              'scale' => 100,       'offset' => 0,   'units' => 'percent'],
-                85 => ['field_name' => 'step_length',                      'scale' => 10,        'offset' => 0,   'units' => 'mm'],
-                253 => ['field_name' => 'timestamp',                       'scale' => 1,         'offset' => 0,   'units' => 's']
-            ]
-        ],
-
-        21 => [
-            'mesg_name' => 'event', 'field_defns' => [
-                0 => ['field_name' => 'event',       'scale' => 1, 'offset' => 0, 'units' => ''],
-                1 => ['field_name' => 'event_type',  'scale' => 1, 'offset' => 0, 'units' => ''],
-                3 => ['field_name' => 'data',        'scale' => 1, 'offset' => 0, 'units' => ''],
-                4 => ['field_name' => 'event_group', 'scale' => 1, 'offset' => 0, 'units' => ''],
-                253 => ['field_name' => 'timestamp', 'scale' => 1, 'offset' => 0, 'units' => 's']
-            ]
-        ],
-
-        23 => [
-            'mesg_name' => 'device_info', 'field_defns' => [
-                0 => ['field_name' => 'device_index',           'scale' => 1, 'offset' => 0, 'units' => ''],
-                1 => ['field_name' => 'device_type',            'scale' => 1, 'offset' => 0, 'units' => ''],
-                2 => ['field_name' => 'manufacturer',           'scale' => 1, 'offset' => 0, 'units' => ''],
-                3 => ['field_name' => 'serial_number',          'scale' => 1, 'offset' => 0, 'units' => ''],
-                4 => ['field_name' => 'product',                'scale' => 1, 'offset' => 0, 'units' => ''],
-                5 => ['field_name' => 'software_version',       'scale' => 1, 'offset' => 0, 'units' => ''],
-                6 => ['field_name' => 'hardware_version',       'scale' => 1, 'offset' => 0, 'units' => ''],
-                7 => ['field_name' => 'cum_operating_time',     'scale' => 1, 'offset' => 0, 'units' => ''],
-                10 => ['field_name' => 'battery_voltage',       'scale' => 1, 'offset' => 0, 'units' => ''],
-                11 => ['field_name' => 'battery_status',        'scale' => 1, 'offset' => 0, 'units' => ''],
-                20 => ['field_name' => 'ant_transmission_type', 'scale' => 1, 'offset' => 0, 'units' => ''],
-                21 => ['field_name' => 'ant_device_number',     'scale' => 1, 'offset' => 0, 'units' => ''],
-                22 => ['field_name' => 'ant_network',           'scale' => 1, 'offset' => 0, 'units' => ''],
-                25 => ['field_name' => 'source_type',           'scale' => 1, 'offset' => 0, 'units' => ''],
-                253 => ['field_name' => 'timestamp',            'scale' => 1, 'offset' => 0, 'units' => 's']
-            ]
-        ],
-
-        34 => [
-            'mesg_name' => 'activity', 'field_defns' => [
-                0 => ['field_name' => 'total_timer_time', 'scale' => 1000, 'offset' => 0, 'units' => 's'],
-                1 => ['field_name' => 'num_sessions',     'scale' => 1,    'offset' => 0, 'units' => ''],
-                2 => ['field_name' => 'type',             'scale' => 1,    'offset' => 0, 'units' => ''],
-                3 => ['field_name' => 'event',            'scale' => 1,    'offset' => 0, 'units' => ''],
-                4 => ['field_name' => 'event_type',       'scale' => 1,    'offset' => 0, 'units' => ''],
-                5 => ['field_name' => 'local_timestamp',  'scale' => 1,    'offset' => 0, 'units' => ''],
-                6 => ['field_name' => 'event_group',      'scale' => 1,    'offset' => 0, 'units' => ''],
-                253 => ['field_name' => 'timestamp',      'scale' => 1,    'offset' => 0, 'units' => 's']
-            ]
-        ],
-
-        49 => [
-            'mesg_name' => 'file_creator', 'field_defns' => [
-                0 => ['field_name' => 'software_version', 'scale' => 1, 'offset' => 0, 'units' => ''],
-                1 => ['field_name' => 'hardware_version', 'scale' => 1, 'offset' => 0, 'units' => '']
-            ]
-        ],
-
-        78 => [
-            'mesg_name' => 'hrv', 'field_defns' => [
-                0 => ['field_name' => 'time', 'scale' => 1000, 'offset' => 0, 'units' => 's']
-            ]
-        ],
-
-        101 => [
-            'mesg_name' => 'length', 'field_defns' => [
-                0 => ['field_name' => 'event',                'scale' => 1,    'offset' => 0, 'units' => ''],
-                1 => ['field_name' => 'event_type',           'scale' => 1,    'offset' => 0, 'units' => ''],
-                2 => ['field_name' => 'start_time',           'scale' => 1,    'offset' => 0, 'units' => ''],
-                3 => ['field_name' => 'total_elapsed_time',   'scale' => 1000, 'offset' => 0, 'units' => 's'],
-                4 => ['field_name' => 'total_timer_time',     'scale' => 1000, 'offset' => 0, 'units' => 's'],
-                5 => ['field_name' => 'total_strokes',        'scale' => 1,    'offset' => 0, 'units' => 'strokes'],
-                6 => ['field_name' => 'avg_speed',            'scale' => 1000, 'offset' => 0, 'units' => 'm/s'],
-                7 => ['field_name' => 'swim_stroke',          'scale' => 1,    'offset' => 0, 'units' => 'swim_stroke'],
-                9 => ['field_name' => 'avg_swimming_cadence', 'scale' => 1,    'offset' => 0, 'units' => 'strokes/min'],
-                10 => ['field_name' => 'event_group',         'scale' => 1,    'offset' => 0, 'units' => ''],
-                11 => ['field_name' => 'total_calories',      'scale' => 1,    'offset' => 0, 'units' => 'kcal'],
-                12 => ['field_name' => 'length_type',         'scale' => 1,    'offset' => 0, 'units' => ''],
-                253 => ['field_name' => 'timestamp',          'scale' => 1,    'offset' => 0, 'units' => 's'],
-                254 => ['field_name' => 'message_index',      'scale' => 1,    'offset' => 0, 'units' => '']
-            ]
-        ],
-
-        // 'event_timestamp' and 'event_timestamp_12' should have scale of 1024 but due to floating point rounding errors.
-        // These are manually divided by 1024 later in the processHrMessages() function.
-        132 => [
-            'mesg_name' => 'hr', 'field_defns' => [
-                0 => ['field_name' => 'fractional_timestamp', 'scale' => 32768, 'offset' => 0, 'units' => 's'],
-                1 => ['field_name' => 'time256',              'scale' => 256,   'offset' => 0, 'units' => 's'],
-                6 => ['field_name' => 'filtered_bpm',         'scale' => 1,     'offset' => 0, 'units' => 'bpm'],
-                9 => ['field_name' => 'event_timestamp',      'scale' => 1,     'offset' => 0, 'units' => 's'],
-                10 => ['field_name' => 'event_timestamp_12',  'scale' => 1,     'offset' => 0, 'units' => 's'],
-                253 => ['field_name' => 'timestamp',          'scale' => 1,     'offset' => 0, 'units' => 's']
-            ]
-        ],
-
-        142 => [
-            'mesg_name' => 'segment_lap', 'field_defns' => [
-                0 => ['field_name' => 'event',                           'scale' => 1,         'offset' => 0, 'units' => ''],
-                1 => ['field_name' => 'event_type',                      'scale' => 1,         'offset' => 0, 'units' => ''],
-                2 => ['field_name' => 'start_time',                      'scale' => 1,         'offset' => 0, 'units' => ''],
-                3 => ['field_name' => 'start_position_lat',              'scale' => 1,         'offset' => 0, 'units' => 'semicircles'],
-                4 => ['field_name' => 'start_position_long',             'scale' => 1,         'offset' => 0, 'units' => 'semicircles'],
-                5 => ['field_name' => 'end_position_lat',                'scale' => 1,         'offset' => 0, 'units' => 'semicircles'],
-                6 => ['field_name' => 'end_position_long',               'scale' => 1,         'offset' => 0, 'units' => 'semicircles'],
-                7 => ['field_name' => 'total_elapsed_time',              'scale' => 1000,      'offset' => 0, 'units' => 's'],
-                8 => ['field_name' => 'total_timer_time',                'scale' => 1000,      'offset' => 0, 'units' => 's'],
-                9 => ['field_name' => 'total_distance',                  'scale' => 100,       'offset' => 0, 'units' => 'm'],
-                10 => ['field_name' => 'total_cycles',                   'scale' => 1,         'offset' => 0, 'units' => 'cycles'],
-                11 => ['field_name' => 'total_calories',                 'scale' => 1,         'offset' => 0, 'units' => 'kcal'],
-                12 => ['field_name' => 'total_fat_calories',             'scale' => 1,         'offset' => 0, 'units' => 'kcal'],
-                13 => ['field_name' => 'avg_speed',                      'scale' => 1000,      'offset' => 0, 'units' => 'm/s'],
-                14 => ['field_name' => 'max_speed',                      'scale' => 1000,      'offset' => 0, 'units' => 'm/s'],
-                15 => ['field_name' => 'avg_heart_rate',                 'scale' => 1,         'offset' => 0, 'units' => 'bpm'],
-                16 => ['field_name' => 'max_heart_rate',                 'scale' => 1,         'offset' => 0, 'units' => 'bpm'],
-                17 => ['field_name' => 'avg_cadence',                    'scale' => 1,         'offset' => 0, 'units' => 'rpm'],
-                18 => ['field_name' => 'max_cadence',                    'scale' => 1,         'offset' => 0, 'units' => 'rpm'],
-                19 => ['field_name' => 'avg_power',                      'scale' => 1,         'offset' => 0, 'units' => 'watts'],
-                20 => ['field_name' => 'max_power',                      'scale' => 1,         'offset' => 0, 'units' => 'watts'],
-                21 => ['field_name' => 'total_ascent',                   'scale' => 1,         'offset' => 0, 'units' => 'm'],
-                22 => ['field_name' => 'total_descent',                  'scale' => 1,         'offset' => 0, 'units' => 'm'],
-                23 => ['field_name' => 'sport',                          'scale' => 1,         'offset' => 0, 'units' => ''],
-                24 => ['field_name' => 'event_group',                    'scale' => 1,         'offset' => 0, 'units' => ''],
-                25 => ['field_name' => 'nec_lat',                        'scale' => 1,         'offset' => 0, 'units' => 'semicircles'],
-                26 => ['field_name' => 'nec_long',                       'scale' => 1,         'offset' => 0, 'units' => 'semicircles'],
-                27 => ['field_name' => 'swc_lat',                        'scale' => 1,         'offset' => 0, 'units' => 'semicircles'],
-                28 => ['field_name' => 'swc_long',                       'scale' => 1,         'offset' => 0, 'units' => 'semicircles'],
-                29 => ['field_name' => 'name',                           'scale' => 1,         'offset' => 0, 'units' => ''],
-                30 => ['field_name' => 'normalized_power',               'scale' => 1,         'offset' => 0, 'units' => 'watts'],
-                31 => ['field_name' => 'left_right_balance',             'scale' => 1,         'offset' => 0, 'units' => ''],
-                32 => ['field_name' => 'sub_sport',                      'scale' => 1,         'offset' => 0, 'units' => ''],
-                33 => ['field_name' => 'total_work',                     'scale' => 1,         'offset' => 0, 'units' => 'J'],
-                58 => ['field_name' => 'sport_event',                    'scale' => 1,         'offset' => 0, 'units' => ''],
-                59 => ['field_name' => 'avg_left_torque_effectiveness',  'scale' => 2,         'offset' => 0, 'units' => 'percent'],
-                60 => ['field_name' => 'avg_right_torque_effectiveness', 'scale' => 2,         'offset' => 0, 'units' => 'percent'],
-                61 => ['field_name' => 'avg_left_pedal_smoothness',      'scale' => 2,         'offset' => 0, 'units' => 'percent'],
-                62 => ['field_name' => 'avg_right_pedal_smoothness',     'scale' => 2,         'offset' => 0, 'units' => 'percent'],
-                63 => ['field_name' => 'avg_combined_pedal_smoothness',  'scale' => 2,         'offset' => 0, 'units' => 'percent'],
-                64 => ['field_name' => 'status',                         'scale' => 1,         'offset' => 0, 'units' => ''],
-                65 => ['field_name' => 'uuid',                           'scale' => 1,         'offset' => 0, 'units' => ''],
-                66 => ['field_name' => 'avg_fractional_cadence',         'scale' => 128,       'offset' => 0, 'units' => 'rpm'],
-                67 => ['field_name' => 'max_fractional_cadence',         'scale' => 128,       'offset' => 0, 'units' => 'rpm'],
-                68 => ['field_name' => 'total_fractional_cycles',        'scale' => 128,       'offset' => 0, 'units' => 'cycles'],
-                69 => ['field_name' => 'front_gear_shift_count',         'scale' => 1,         'offset' => 0, 'units' => ''],
-                70 => ['field_name' => 'rear_gear_shift_count',          'scale' => 1,         'offset' => 0, 'units' => ''],
-                71 => ['field_name' => 'time_standing',                  'scale' => 1000,      'offset' => 0, 'units' => 's'],
-                72 => ['field_name' => 'stand_count',                    'scale' => 1,         'offset' => 0, 'units' => ''],
-                73 => ['field_name' => 'avg_left_pco',                   'scale' => 1,         'offset' => 0, 'units' => 'mm'],
-                74 => ['field_name' => 'avg_right_pco',                  'scale' => 1,         'offset' => 0, 'units' => 'mm'],
-                75 => ['field_name' => 'avg_left_power_phase',           'scale' => 0.7111111, 'offset' => 0, 'units' => 'degrees'],
-                76 => ['field_name' => 'avg_left_power_phase_peak',      'scale' => 0.7111111, 'offset' => 0, 'units' => 'degrees'],
-                77 => ['field_name' => 'avg_right_power_phase',          'scale' => 0.7111111, 'offset' => 0, 'units' => 'degrees'],
-                78 => ['field_name' => 'avg_right_power_phase_peak',     'scale' => 0.7111111, 'offset' => 0, 'units' => 'degrees'],
-                79 => ['field_name' => 'avg_power_position',             'scale' => 1,         'offset' => 0, 'units' => 'watts'],
-                80 => ['field_name' => 'max_power_position',             'scale' => 1,         'offset' => 0, 'units' => 'watts'],
-                81 => ['field_name' => 'avg_cadence_position',           'scale' => 1,         'offset' => 0, 'units' => 'rpm'],
-                82 => ['field_name' => 'max_cadence_position',           'scale' => 1,         'offset' => 0, 'units' => 'rpm'],
-                253 => ['field_name' => 'timestamp',                     'scale' => 1,         'offset' => 0, 'units' => 's'],
-                254 => ['field_name' => 'message_index',                 'scale' => 1,         'offset' => 0, 'units' => '']
-            ]
-        ],
-
-        206 => [
-            'mesg_name' => 'field_description', 'field_defns' => [
-                0 => ['field_name' => 'developer_data_index',    'scale' => 1, 'offset' => 0, 'units' => ''],
-                1 => ['field_name' => 'field_definition_number', 'scale' => 1, 'offset' => 0, 'units' => ''],
-                2 => ['field_name' => 'fit_base_type_id',        'scale' => 1, 'offset' => 0, 'units' => ''],
-                3 => ['field_name' => 'field_name',              'scale' => 1, 'offset' => 0, 'units' => ''],
-                4 => ['field_name' => 'array',                   'scale' => 1, 'offset' => 0, 'units' => ''],
-                5 => ['field_name' => 'components',              'scale' => 1, 'offset' => 0, 'units' => ''],
-                6 => ['field_name' => 'scale',                   'scale' => 1, 'offset' => 0, 'units' => ''],
-                7 => ['field_name' => 'offset',                  'scale' => 1, 'offset' => 0, 'units' => ''],
-                8 => ['field_name' => 'units',                   'scale' => 1, 'offset' => 0, 'units' => ''],
-                9 => ['field_name' => 'bits',                    'scale' => 1, 'offset' => 0, 'units' => ''],
-                10 => ['field_name' => 'accumulate',             'scale' => 1, 'offset' => 0, 'units' => ''],
-                13 => ['field_name' => 'fit_base_unit_id',       'scale' => 1, 'offset' => 0, 'units' => ''],
-                14 => ['field_name' => 'native_mesg_num',        'scale' => 1, 'offset' => 0, 'units' => ''],
-                15 => ['field_name' => 'native_field_num',       'scale' => 1, 'offset' => 0, 'units' => '']
-            ]
-        ],
-
-        207 => [
-            'mesg_name' => 'developer_data_id', 'field_defns' => [
-                0 => ['field_name' => 'developer_id',         'scale' => 1, 'offset' => 0, 'units' => ''],
-                1 => ['field_name' => 'application_id',       'scale' => 1, 'offset' => 0, 'units' => ''],
-                2 => ['field_name' => 'manufacturer_id',      'scale' => 1, 'offset' => 0, 'units' => ''],
-                3 => ['field_name' => 'developer_data_index', 'scale' => 1, 'offset' => 0, 'units' => ''],
-                4 => ['field_name' => 'application_version',  'scale' => 1, 'offset' => 0, 'units' => '']
-            ]
-        ],
-
-        258 => [
-            'mesg_name' => 'dive_settings', 'field_defns' => [
-                0 => ['field_name' => 'name',                     'scale' => 1,   'offset' => 0, 'units' => ''],
-                1 => ['field_name' => 'model',                    'scale' => 1,   'offset' => 0, 'units' => ''],
-                2 => ['field_name' => 'gf_low',                   'scale' => 1,   'offset' => 0, 'units' => 'percent'],
-                3 => ['field_name' => 'gf_high',                  'scale' => 1,   'offset' => 0, 'units' => 'percent'],
-                4 => ['field_name' => 'water_type',               'scale' => 1,   'offset' => 0, 'units' => ''],
-                5 => ['field_name' => 'water_density',            'scale' => 1,   'offset' => 0, 'units' => 'kg/m^3'],
-                6 => ['field_name' => 'po2_warn',                 'scale' => 100, 'offset' => 0, 'units' => 'percent'],
-                7 => ['field_name' => 'po2_critical',             'scale' => 100, 'offset' => 0, 'units' => 'percent'],
-                8 => ['field_name' => 'po2_deco',                 'scale' => 100, 'offset' => 0, 'units' => 'percent'],
-                9 => ['field_name' => 'safety_stop_enabled',      'scale' => 1,   'offset' => 0, 'units' => ''],
-                10 => ['field_name' => 'bottom_depth',            'scale' => 1,   'offset' => 0, 'units' => ''],
-                11 => ['field_name' => 'bottom_time',             'scale' => 1,   'offset' => 0, 'units' => ''],
-                12 => ['field_name' => 'apnea_countdown_enabled', 'scale' => 1,   'offset' => 0, 'units' => ''],
-                13 => ['field_name' => 'apnea_countdown_time',    'scale' => 1,   'offset' => 0, 'units' => ''],
-                14 => ['field_name' => 'backlight_mode',          'scale' => 1,   'offset' => 0, 'units' => ''],
-                15 => ['field_name' => 'backlight_brightness',    'scale' => 1,   'offset' => 0, 'units' => ''],
-                16 => ['field_name' => 'backlight_timeout',       'scale' => 1,   'offset' => 0, 'units' => ''],
-                17 => ['field_name' => 'repeat_dive_interval',    'scale' => 1,   'offset' => 0, 'units' => 's'],
-                18 => ['field_name' => 'safety_stop_time',        'scale' => 1,   'offset' => 0, 'units' => 's'],
-                19 => ['field_name' => 'heart_rate_source_type',  'scale' => 1,   'offset' => 0, 'units' => ''],
-                20 => ['field_name' => 'heart_rate_source',       'scale' => 1,   'offset' => 0, 'units' => ''],
-                254 => ['field_name' => 'message_index',          'scale' => 1,   'offset' => 0, 'units' => '']
-              ]
-          ],
-
-        259 => [
-            'mesg_name' => 'dive_gas', 'field_defns' => [
-                0 => ['field_name' => 'helium_content',  'scale' => 1, 'offset' => 0, 'units' => 'percent'],
-                1 => ['field_name' => 'oxygen_content',  'scale' => 1, 'offset' => 0, 'units' => 'percent'],
-                2 => ['field_name' => 'status',          'scale' => 1, 'offset' => 0, 'units' => ''],
-                254 => ['field_name' => 'message_index', 'scale' => 1, 'offset' => 0, 'units' => '']
-              ]
-          ],
-
-        262 => [
-            'mesg_name' => 'dive_alarm', 'field_defns' => [
-                0 => ['field_name' => 'depth',           'scale' => 1000, 'offset' => 0, 'units' => 'm'],
-                1 => ['field_name' => 'time',            'scale' => 1,    'offset' => 0, 'units' => 's'],
-                2 => ['field_name' => 'enabled',         'scale' => 1,    'offset' => 0, 'units' => ''],
-                3 => ['field_name' => 'alarm_type',      'scale' => 1,    'offset' => 0, 'units' => ''],
-                4 => ['field_name' => 'sound',           'scale' => 1,    'offset' => 0, 'units' => ''],
-                254 => ['field_name' => 'message_index', 'scale' => 1,    'offset' => 0, 'units' => '']
-              ]
-          ],
-
-        268 => [
-            'mesg_name' => 'dive_summary', 'field_defns' => [
-                0 => ['field_name' => 'reference_mesg',   'scale' => 1,    'offset' => 0, 'units' => ''],
-                1 => ['field_name' => 'reference_index',  'scale' => 1,    'offset' => 0, 'units' => ''],
-                2 => ['field_name' => 'avg_depth',        'scale' => 1000, 'offset' => 0, 'units' => 'm'],
-                3 => ['field_name' => 'max_depth',        'scale' => 1000, 'offset' => 0, 'units' => 'm'],
-                4 => ['field_name' => 'surface_interval', 'scale' => 1,    'offset' => 0, 'units' => 's'],
-                5 => ['field_name' => 'start_cns',        'scale' => 1,    'offset' => 0, 'units' => 'percent'],
-                6 => ['field_name' => 'end_cns',          'scale' => 1,    'offset' => 0, 'units' => 'percent'],
-                7 => ['field_name' => 'start_n2',         'scale' => 1,    'offset' => 0, 'units' => 'percent'],
-                8 => ['field_name' => 'end_n2',           'scale' => 1,    'offset' => 0, 'units' => 'percent'],
-                9 => ['field_name' => 'o2_toxicity',      'scale' => 1,    'offset' => 0, 'units' => 'OTUs'],
-                10 => ['field_name' => 'dive_number',     'scale' => 1,    'offset' => 0, 'units' => ''],
-                11 => ['field_name' => 'bottom_time',     'scale' => 1000, 'offset' => 0, 'units' => 's'],
-                253 => ['field_name' => 'timestamp',      'scale' => 1,    'offset' => 0, 'units' => 's']
-              ]
-          ]
     ];
+
+    /**
+     * Profile::MESSAGES in the shape this class reads -- mesg_name, and field_defns with
+     * field_name, type, scale, offset, units and, where the profile has them, components,
+     * accumulated, accumulate_from and subfields -- with FIELD_OVERRIDES applied. Built once per
+     * process.
+     */
+    private static function messageInfo(): array
+    {
+        static $info = null;
+        if ($info !== null) {
+            return $info;
+        }
+
+        $info = [];
+        foreach (Profile::MESSAGES as $num => $message) {
+            $fields = [];
+            foreach ($message['fields'] as $field_num => $field) {
+                $field = array_replace(['field_name' => $field['name'], 'num' => $field_num] + $field, self::FIELD_OVERRIDES[$num][$field_num] ?? []);
+                foreach ($field['subfields'] ?? [] as $i => $subfield) {
+                    $field['subfields'][$i]['field_name'] = $subfield['name'];
+                }
+                $fields[$field_num] = $field;
+            }
+            // An accumulated field is seeded, when a message carries it outright, in the units of
+            // the component that accumulates into it.
+            foreach ($fields as $field) {
+                foreach ($field['components'] ?? [] as [$target, , $scale, $offset]) {
+                    if (!empty($fields[$target]['accumulated']) && !isset($fields[$target]['accumulate_from'])) {
+                        $fields[$target]['accumulate_from'] = [$scale, $offset];
+                    }
+                }
+            }
+            $info[$num] = ['mesg_name' => $message['name'], 'field_defns' => $fields];
+        }
+
+        return $info;
+    }
 
     // PHP Constructor - called when an object of the class is instantiated.
     public function __construct($file_path_or_data, $options = null)
@@ -1555,29 +1247,41 @@ class phpFITFileAnalysis
              * 3.3 FIT File Structure
              * Header . Data Records . CRC
              */
-            $this->file_contents = file_get_contents($file_path_or_data);  // Read the entire file into a string
-
+            $contents = file_get_contents($file_path_or_data);  // Read the entire file into a string
+            if ($contents === false) {
+                throw new \Exception('phpFITFileAnalysis->__construct(): file \''.$file_path_or_data.'\' could not be read!');
+            }
+            $this->file_contents = $contents;
         }
 
-        $this->options = $options;
+        $this->options = is_array($options) ? $options : [];
         if (isset($options['garmin_timestamps']) && $options['garmin_timestamps'] == true) {
             $this->garmin_timestamps = true;
         }
-        // CX-87: a developer field whose description names a native message and field number
-        // (native_mesg_num / native_field_num) replaces that native field -- that is what the
-        // declaration means in the FIT profile, and it is how Stryd's running power is written
-        // beside a watch's own estimate. Upstream forced this option to false and then re-read it,
-        // so no caller could ever enable it. Default on; pass false to keep the native data.
-        $this->options['overwrite_with_dev_data'] = !(isset($options['overwrite_with_dev_data']) && $options['overwrite_with_dev_data'] == false);
+        // FIT SDK decoding: subfields on by default. Components off by default: expanding speed into
+        // enhanced_speed (and altitude into enhanced_altitude) would hold, fill in and convert a
+        // second copy of each stream. 'enhanced' expands into enhanced_* fields only, true into
+        // every component. See namedValues().
+        $this->options['expand_subfields'] = $options['expand_subfields'] ?? true;
+        $this->options['expand_components'] = $options['expand_components'] ?? false;
+        // CX-87: a developer field declaring record power (Stryd's) replaces the watch's power, one
+        // session at a time; see applyDeveloperOverrides(). False reads the file as before.
+        $this->options['overwrite_with_dev_data'] = $options['overwrite_with_dev_data'] ?? true;
+        $this->data_mesg_info = self::messageInfo();
         $this->php_trader_ext_loaded = extension_loaded('trader');
 
         // Process the file contents.
-        $this->readHeader();
-        $this->readDataRecords();
-        $this->oneElementArrays();
+        $this->readFile();
 
-        // Process HR messages
+        // Process HR messages. Before oneElementArrays(): with a single hr message carrying
+        // event_timestamp_12 that would unwrap the list of byte arrays into one byte array.
         $this->processHrMessages();
+        // 'always_arrays' => true keeps every field a list (record fields keyed by timestamp), so a
+        // file with one session reads like a file with two. By default a one-value field is that
+        // value, which callers have relied on.
+        if (empty($this->options['always_arrays'])) {
+            $this->oneElementArrays();
+        }
 
         // Handle options.
         $this->fixData($this->options);
@@ -1587,375 +1291,841 @@ class phpFITFileAnalysis
     /**
      * D00001275 Flexible & Interoperable Data Transfer (FIT) Protocol Rev 1.7.pdf
      * Table 3-1. Byte Description of File Header
+     *
+     * Reads the header at the file pointer. A chained FIT file is several Header . Data . CRC runs
+     * back to back, so this is called once per run; see readFile().
      */
-    private function readHeader()
+    private function readHeader(): void
     {
-        $header_size = unpack('C1header_size', substr($this->file_contents, $this->file_pointer, 1))['header_size'];
-        $this->file_pointer++;
+        $file_start = $this->file_pointer;
+        if (strlen($this->file_contents) - $file_start < 12) {
+            throw new FitParseException('phpFITFileAnalysis->readHeader(): not a valid header size!');
+        }
+        $header_size = ord($this->file_contents[$file_start]);
 
-        if ($header_size != 12 && $header_size != 14) {
-            throw new \Exception('phpFITFileAnalysis->readHeader(): not a valid header size!');
+        if ($header_size < 12) {
+            throw new FitParseException('phpFITFileAnalysis->readHeader(): not a valid header size!');
+        }
+        if (strlen($this->file_contents) - $file_start < $header_size) {
+            throw new FitParseException('phpFITFileAnalysis->readHeader(): file is truncated in its header!');
         }
 
         $header_fields = 'C1protocol_version/' .
             'v1profile_version/' .
             'V1data_size/' .
             'C4data_type';
-        if ($header_size > 12) {
+        if ($header_size >= 14) {
             $header_fields .= '/v1crc';
         }
-        $this->file_header = unpack($header_fields, substr($this->file_contents, $this->file_pointer, $header_size - 1));
+        $this->file_header = unpack($header_fields, substr($this->file_contents, $file_start + 1, min($header_size, 14) - 1));
         $this->file_header['header_size'] = $header_size;
-
-        $this->file_pointer += $this->file_header['header_size'] - 1;
 
         $file_extension = sprintf('%c%c%c%c', $this->file_header['data_type1'], $this->file_header['data_type2'], $this->file_header['data_type3'], $this->file_header['data_type4']);
 
         if ($file_extension != '.FIT' || $this->file_header['data_size'] <= 0) {
-            throw new \Exception('phpFITFileAnalysis->readHeader(): not a valid FIT file!');
+            throw new FitParseException('phpFITFileAnalysis->readHeader(): not a valid FIT file!');
         }
 
-        if (strlen($this->file_contents) - $header_size - 2 !== $this->file_header['data_size']) {
-            // Overwrite the data_size. Seems to be incorrect if there are buffered messages e.g. HR records.
-            //$this->file_header['data_size'] = $this->file_header['crc'] - $header_size + 2;
+        $this->file_pointer = $file_start + $header_size;
+        $this->data_end = $this->file_pointer + $this->file_header['data_size'];
+
+        if (!empty($this->options['validate_crc'])) {
+            $this->validateCrc($file_start, $header_size);
         }
     }
 
     /**
-     * Reads the remainder of $this->file_contents and store the data in the $this->data_mesgs array.
+     * Header . Data Records . CRC, repeated for a chained file. Local message types are scoped to
+     * one run, so definitions are forgotten between runs; everything decoded accumulates.
      */
-    private function readDataRecords()
+    private function readFile(): void
     {
-        $record_header_byte = 0;
-        $message_type = 0;
-        $developer_data_flag = 0;
-        $local_mesg_type = 0;
-        $previousTS = 0;
-        // APP-1554: running maximum of record timestamps, maintained instead of
-        // rescanning the accumulated array on every record. See the fallback below.
-        $max_record_timestamp = null;
-        // APP-1788: lap messages read so far, and each lap field's length before the current one.
-        $lap_count = 0;
-        $lap_field_counts = [];
+        do {
+            $this->readHeader();
+            $this->readDataRecords();
+            $this->defn_mesgs = [];
+            $this->file_pointer = $this->data_end + 2;  // past the file CRC
+        } while ($this->anotherFileFollows());
+        $this->padDeveloperValues();
+        // CX-87: before the copy, which skips the declarations the override applied.
+        $this->applyDeveloperOverrides();
+        $this->copyDeveloperDeclarations();
+    }
 
-        while ($this->file_header['header_size'] + $this->file_header['data_size'] > $this->file_pointer) {
-            $record_header_byte = ord(substr($this->file_contents, $this->file_pointer, 1));
+    private function anotherFileFollows(): bool
+    {
+        $remaining = strlen($this->file_contents) - $this->file_pointer;
+
+        return $remaining >= 12
+            && ord($this->file_contents[$this->file_pointer]) >= 12
+            && substr($this->file_contents, $this->file_pointer + 8, 4) === '.FIT';
+    }
+
+    /**
+     * Opt-in ('validate_crc' => true): the header CRC when a 14-byte header carries one (0 means
+     * not computed), and the file CRC over header and data.
+     */
+    private function validateCrc(int $file_start, int $header_size): void
+    {
+        if ($header_size >= 14 && $this->file_header['crc'] !== 0
+            && self::crc16(substr($this->file_contents, $file_start, 12)) !== $this->file_header['crc']) {
+            throw new FitParseException('phpFITFileAnalysis->validateCrc(): header CRC does not match!');
+        }
+        $crc_bytes = substr($this->file_contents, $this->data_end, 2);
+        if (strlen($crc_bytes) < 2) {
+            throw new FitParseException('phpFITFileAnalysis->validateCrc(): file is truncated, no CRC!');
+        }
+        if (self::crc16(substr($this->file_contents, $file_start, $this->data_end - $file_start)) !== unpack('v', $crc_bytes)[1]) {
+            throw new FitParseException('phpFITFileAnalysis->validateCrc(): file CRC does not match!');
+        }
+    }
+
+    /**
+     * FIT CRC-16 (FIT Protocol, 3.3.2), a nibble at a time.
+     */
+    public static function crc16(string $data): int
+    {
+        static $table = [0x0000, 0xCC01, 0xD801, 0x1400, 0xF001, 0x3C00, 0x2800, 0xE401, 0xA001, 0x6C00, 0x7800, 0xB401, 0x5000, 0x9C01, 0x8801, 0x4400];
+
+        $crc = 0;
+        $length = strlen($data);
+        for ($i = 0; $i < $length; ++$i) {
+            $byte = ord($data[$i]);
+            $tmp = $table[$crc & 0xF];
+            $crc = (($crc >> 4) & 0x0FFF) ^ $tmp ^ $table[$byte & 0xF];
+            $tmp = $table[$crc & 0xF];
+            $crc = (($crc >> 4) & 0x0FFF) ^ $tmp ^ $table[($byte >> 4) & 0xF];
+        }
+
+        return $crc;
+    }
+
+    /**
+     * Reads the data records of the current run of $this->file_contents and stores the data in the
+     * $this->data_mesgs array.
+     */
+    private function readDataRecords(): void
+    {
+        while ($this->file_pointer < $this->data_end) {
+            if ($this->file_pointer >= strlen($this->file_contents)) {
+                throw new FitParseException('phpFITFileAnalysis->readDataRecords(): file is truncated at offset ' . $this->file_pointer . '!');
+            }
+            $record_header_byte = ord($this->file_contents[$this->file_pointer]);
             $this->file_pointer++;
 
-            $compressedTimestamp = false;
-            $tsOffset = 0;
             /**
              * D00001275 Flexible & Interoperable Data Transfer (FIT) Protocol Rev 2.2.pdf
              * Table 4-1. Normal Header Bit Field Description
+             * Table 4-2. Compressed Timestamp Header Bit Field Description
              */
-            if (($record_header_byte >> 7) & 1) {  // Check that it's a normal header
-                // Header with compressed timestamp
-                $message_type = 0;  //always 0: DATA_MESSAGE
-                $developer_data_flag = 0;  // always 0: DATA_MESSAGE
-                $local_mesg_type = ($record_header_byte >> 5) & 3;  // bindec('0011') == 3
-                $tsOffset = $record_header_byte & 31;
-                $compressedTimestamp = true;
+            if ($record_header_byte & 0x80) {
+                // Compressed timestamp header: always a data message, no developer data.
+                $local_mesg_type = ($record_header_byte >> 5) & 0x03;
+                $this->readDataMessage($local_mesg_type, $record_header_byte & 0x1F);
+            } elseif ($record_header_byte & 0x40) {
+                $this->readDefinitionMessage($record_header_byte & 0x0F, (bool) ($record_header_byte & 0x20));
             } else {
-                //Normal header
-                $message_type = ($record_header_byte >> 6) & 1;  // 1: DEFINITION_MESSAGE; 0: DATA_MESSAGE
-                $developer_data_flag = ($record_header_byte >> 5) & 1;  // 1: DEFINITION_MESSAGE; 0: DATA_MESSAGE
-                $local_mesg_type = $record_header_byte & 15;  // bindec('1111') == 15
-            }
-
-            switch ($message_type) {
-                case DEFINITION_MESSAGE:
-                    /**
-                     * D00001275 Flexible & Interoperable Data Transfer (FIT) Protocol Rev 1.7.pdf
-                     * Table 4-1. Normal Header Bit Field Description
-                     */
-                    $this->file_pointer++;  // Reserved - IGNORED
-                    $architecture = ord(substr($this->file_contents, $this->file_pointer, 1));  // Architecture
-                    $this->file_pointer++;
-
-                    $this->types = $this->endianness[$architecture] ?? [];
-
-                    $global_mesg_num = ($architecture === 0) ? unpack('v1tmp', substr($this->file_contents, $this->file_pointer, 2))['tmp'] : unpack('n1tmp', substr($this->file_contents, $this->file_pointer, 2))['tmp'];
-                    $this->file_pointer += 2;
-
-                    $num_fields = ord(substr($this->file_contents, $this->file_pointer, 1));
-                    $this->file_pointer++;
-
-                    $field_definitions = [];
-                    $total_size = 0;
-                    for ($i=0; $i<$num_fields; ++$i) {
-                        $field_definition_number = ord(substr($this->file_contents, $this->file_pointer, 1));
-                        $this->file_pointer++;
-                        $size = ord(substr($this->file_contents, $this->file_pointer, 1));
-                        $this->file_pointer++;
-                        $base_type = ord(substr($this->file_contents, $this->file_pointer, 1));
-                        $this->file_pointer++;
-
-                        $field_definitions[] = ['field_definition_number' => $field_definition_number, 'size' => $size, 'base_type' => $base_type];
-                        $total_size += $size;
-                    }
-
-                    $num_dev_fields = 0;
-                    $dev_field_definitions = [];
-                    if ($developer_data_flag === 1) {
-                        $num_dev_fields = ord(substr($this->file_contents, $this->file_pointer, 1));
-                        $this->file_pointer++;
-
-                        for ($i=0; $i<$num_dev_fields; ++$i) {
-                            $field_definition_number = ord(substr($this->file_contents, $this->file_pointer, 1));
-                            $this->file_pointer++;
-                            $size = ord(substr($this->file_contents, $this->file_pointer, 1));
-                            $this->file_pointer++;
-                            $developer_data_index = ord(substr($this->file_contents, $this->file_pointer, 1));
-                            $this->file_pointer++;
-
-                            $dev_field_definitions[] = ['field_definition_number' => $field_definition_number, 'size' => $size, 'developer_data_index' => $developer_data_index];
-                            $total_size += $size;
-                        }
-                    }
-
-                    $this->defn_mesgs[$local_mesg_type] = [
-                            'global_mesg_num' => $global_mesg_num,
-                            'num_fields' => $num_fields,
-                            'field_defns' => $field_definitions,
-                            'num_dev_fields' => $num_dev_fields,
-                            'dev_field_definitions' => $dev_field_definitions,
-                            'total_size' => $total_size
-                        ];
-                    $this->defn_mesgs_all[] = [
-                            'global_mesg_num' => $global_mesg_num,
-                            'num_fields' => $num_fields,
-                            'field_defns' => $field_definitions,
-                            'num_dev_fields' => $num_dev_fields,
-                            'dev_field_definitions' => $dev_field_definitions,
-                            'total_size' => $total_size
-                        ];
-                    break;
-
-                case DATA_MESSAGE:
-                    // Check that we have information on the Data Message.
-                    if (isset($this->data_mesg_info[$this->defn_mesgs[$local_mesg_type]['global_mesg_num']])) {
-                        $is_lap_mesg = $this->defn_mesgs[$local_mesg_type]['global_mesg_num'] === 19;
-                        if ($is_lap_mesg) {
-                            $lap_field_counts = array_map('count', $this->data_mesgs['lap'] ?? []);
-                        }
-                        $is_session_mesg = $this->defn_mesgs[$local_mesg_type]['global_mesg_num'] === 18;
-                        if ($is_session_mesg) {
-                            $session_field_counts = array_map('count', $this->data_mesgs['session'] ?? []);
-                        }
-                        $tmp_record_array = [];  // Temporary array to store Record data message pieces
-                        $tmp_dev_overrides = [];  // CX-87: developer values that replace a native field on this record, by native name
-                        $tmp_value = null;  // Placeholder for value for checking before inserting into the tmp_record_array
-
-                        foreach ($this->defn_mesgs[$local_mesg_type]['field_defns'] as $field_defn) {
-                            // Check that we have information on the Field Definition and a valid base type exists.
-                            if (isset($this->data_mesg_info[$this->defn_mesgs[$local_mesg_type]['global_mesg_num']]['field_defns'][$field_defn['field_definition_number']]) && isset($this->types[$field_defn['base_type']])) {
-                                $base_type = $field_defn['base_type'];
-                                $global_mesg_num = $this->defn_mesgs[$local_mesg_type]['global_mesg_num'];
-
-                                if (!isset($this->types[$base_type])) {
-                                    throw new \RuntimeException("Unknown base type: $base_type");
-                                }
-
-                                // Dynamically set the format for base_type 7 (string)
-                                if ($base_type === 7) {
-                                    $format = 'a' . $field_defn['size'] . 'tmp';
-                                    $expectedBytes = $field_defn['size'];
-                                } else {
-                                    $format = $this->types[$base_type]['format'];
-                                    $expectedBytes = $this->types[$base_type]['bytes'];
-                                }
-
-                                $data = substr($this->file_contents, $this->file_pointer, $expectedBytes);
-                                if (strlen($data) < $expectedBytes) {
-                                    throw new \RuntimeException("Not enough bytes to unpack format '$format'. Expected $expectedBytes, got " . strlen($data) . " at offset {$this->file_pointer}, base_type $base_type, field_size {$field_defn['size']}");
-                                }
-
-                                $tmp_value = unpack($format, $data)['tmp'];
-                                //$tmp_value = unpack($this->types[$base_type]['format'], substr($this->file_contents, $this->file_pointer, $field_defn['size']))['tmp'];
-
-                                // Check if it's an invalid value for the type
-                                if ($tmp_value !== $this->invalid_values[$base_type] ||
-                                   $global_mesg_num === 132) {
-                                    // If it's a timestamp, compensate between different in FIT and Unix timestamp epochs
-                                    if ($field_defn['field_definition_number'] === 253 && !$this->garmin_timestamps) {
-                                        $tmp_value += FIT_UNIX_TS_DIFF;
-                                    }
-
-                                    // If it's a Record data message, store all the pieces in the temporary array as the timestamp may not be first...
-                                    if ($global_mesg_num === 20) {
-                                        $tmp_record_array[$this->data_mesg_info[$global_mesg_num]['field_defns'][$field_defn['field_definition_number']]['field_name']] = $tmp_value / $this->data_mesg_info[$global_mesg_num]['field_defns'][$field_defn['field_definition_number']]['scale'] - $this->data_mesg_info[$global_mesg_num]['field_defns'][$field_defn['field_definition_number']]['offset'];
-                                    } elseif ($global_mesg_num === 206) {  // Developer Data
-                                        $tmp_record_array[$this->data_mesg_info[$global_mesg_num]['field_defns'][$field_defn['field_definition_number']]['field_name']] = $tmp_value;
-                                    } else {
-                                        if ($base_type === 7) {  // Handle strings appropriately
-                                            $this->data_mesgs[$this->data_mesg_info[$global_mesg_num]['mesg_name']][$this->data_mesg_info[$global_mesg_num]['field_defns'][$field_defn['field_definition_number']]['field_name']][] = filter_var($tmp_value, FILTER_SANITIZE_STRING);
-                                        } else {
-                                            // Handle arrays
-                                            if ($field_defn['size'] !== $this->types[$base_type]['bytes']) {
-                                                $tmp_array = [];
-                                                $num_vals = $field_defn['size'] / $this->types[$base_type]['bytes'];
-
-                                                for ($i = 0; $i < $num_vals; ++$i) {
-                                                    $offset_bytes = $this->file_pointer + ($i * $this->types[$base_type]['bytes']);
-                                                    $expected_bytes = $this->types[$base_type]['bytes'];
-                                                    $data = substr($this->file_contents, $offset_bytes, $expected_bytes);
-
-                                                    if (strlen($data) < $expected_bytes) {
-                                                        throw new \RuntimeException("Not enough bytes to unpack array value for base_type $base_type. Expected $expected_bytes bytes, got " . strlen($data) . " at offset $offset_bytes.");
-                                                    }
-
-                                                    // 💡 Add this logic for base_type 7
-                                                    $format = $this->types[$base_type]['format'];
-                                                    $value = unpack($format, $data)['tmp'];
-
-                                                    $scaled = $value / $this->data_mesg_info[$global_mesg_num]['field_defns'][$field_defn['field_definition_number']]['scale']
-                                                            - $this->data_mesg_info[$global_mesg_num]['field_defns'][$field_defn['field_definition_number']]['offset'];
-
-                                                    $tmp_array[] = $scaled;
-                                                }
-
-//                                                for ($i=0; $i<$num_vals; ++$i) {
-//                                                    $tmp_array[] = unpack($this->types[$base_type]['format'], substr($this->file_contents, $this->file_pointer + ($i * $this->types[$base_type]['bytes']), $field_defn['size']))['tmp']/ $this->data_mesg_info[$global_mesg_num]['field_defns'][$field_defn['field_definition_number']]['scale'] - $this->data_mesg_info[$this->defn_mesgs[$local_mesg_type]['global_mesg_num']]['field_defns'][$field_defn['field_definition_number']]['offset'];
-//                                                }
-
-                                                $this->data_mesgs[$this->data_mesg_info[$global_mesg_num]['mesg_name']][$this->data_mesg_info[$global_mesg_num]['field_defns'][$field_defn['field_definition_number']]['field_name']][] = $tmp_array;
-                                            } else {
-                                                $this->data_mesgs[$this->data_mesg_info[$global_mesg_num]['mesg_name']][$this->data_mesg_info[$global_mesg_num]['field_defns'][$field_defn['field_definition_number']]['field_name']][] = $tmp_value / $this->data_mesg_info[$global_mesg_num]['field_defns'][$field_defn['field_definition_number']]['scale'] - $this->data_mesg_info[$this->defn_mesgs[$local_mesg_type]['global_mesg_num']]['field_defns'][$field_defn['field_definition_number']]['offset'];
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    $file_key = $this->data_mesg_info[$global_mesg_num]['mesg_name'];
-                                    $field_key = [$this->data_mesg_info[$global_mesg_num]['field_defns'][$field_defn['field_definition_number']]['field_name']];
-                                    $always_process = [['avg_heart_rate'], ['max_heart_rate'], ['avg_power'], ['max_power'], ['normalized_power'], ['total_work'], ['total_cycles'], ['avg_cadence'], ['max_cadence'], ['avg_fractional_cadence'], ['max_fractional_cadence'], ['training_stress_score'], ['intensity_factor'], ['threshold_power'], ['time_in_hr_zone'], ['total_training_effect'], ['total_ascent'], ['total_descent']];
-
-                                    if ($file_key === 'session' && in_array($field_key, $always_process, true)) {
-                                        $this->data_mesgs[$this->data_mesg_info[$global_mesg_num]['mesg_name']][$this->data_mesg_info[$global_mesg_num]['field_defns'][$field_defn['field_definition_number']]['field_name']][] = null;
-                                    }
-                                }
-                            }
-                            $this->file_pointer += $field_defn['size'];
-                        }
-
-                        // Handle Developer Data
-                        if ($this->defn_mesgs[$local_mesg_type]['global_mesg_num'] === 206) {
-                            $developer_data_index = $tmp_record_array['developer_data_index'];
-                            $field_definition_number = $tmp_record_array['field_definition_number'];
-                            unset($tmp_record_array['developer_data_index']);
-                            unset($tmp_record_array['field_definition_number']);
-                            if (isset($tmp_record_array['field_name'])) {  // Get rid of special/invalid characters after the null terminated string
-                                $tmp_record_array['field_name'] = strtolower(implode('', explode("\0", $tmp_record_array['field_name'])));
-                            }
-                            if (isset($tmp_record_array['units'])) {
-                                $tmp_record_array['units'] = strtolower(implode('', explode("\0", $tmp_record_array['units'])));
-                            }
-                            // CX-87: resolve once which native record field (if any) this developer field replaces.
-                            $tmp_record_array['overrides_native'] = $this->nativeRecordFieldOverriddenBy($tmp_record_array);
-                            $this->dev_field_descriptions[$developer_data_index][$field_definition_number] = $tmp_record_array;
-                            unset($tmp_record_array);
-                        }
-                        foreach ($this->defn_mesgs[$local_mesg_type]['dev_field_definitions'] as $field_defn) {
-                            // Units
-                            if (!isset($this->data_mesgs['developer_data'])) {
-                                $this->data_mesgs['developer_data'] = [];
-                            }
-
-                            if (!isset($this->dev_field_descriptions[$field_defn['developer_data_index']][$field_defn['field_definition_number']])) {
-                                // CX-87: was `continue` without advancing the pointer, which misread
-                                // every byte after an undescribed developer field.
-                                $this->file_pointer += $field_defn['size'];
-                                continue;
-                            }
-
-                            $description = $this->dev_field_descriptions[$field_defn['developer_data_index']][$field_defn['field_definition_number']];
-
-                            $this->data_mesgs['developer_data'][$description['field_name']]['units'] = $description['units'] ?? null;
-
-                            // Data
-                            $dev_value = unpack($this->types[$description['fit_base_type_id']]['format'], substr($this->file_contents, $this->file_pointer, $field_defn['size']))['tmp'];
-                            $this->data_mesgs['developer_data'][$description['field_name']]['data'][] = $dev_value;
-
-                            // CX-87: collect a declared override for THIS record, keyed by its timestamp at the
-                            // flush below; applyDeveloperOverrides() decides where it replaces the native value.
-                            // Two developer fields declaring the same native field: the first valid value wins,
-                            // so a later invalid one never erases an earlier good one.
-                            $overridden = $description['overrides_native'] ?? null;
-                            if ($overridden !== null && $this->defn_mesgs[$local_mesg_type]['global_mesg_num'] === 20 && !isset($tmp_dev_overrides[$overridden])) {
-                                $tmp_dev_overrides[$overridden] = $this->developerValueOrNull($description, $dev_value);
-                            }
-
-                            $this->file_pointer += $field_defn['size'];
-                        }
-
-                        // Process the temporary array and load values into the public data messages array
-                        if (!empty($tmp_record_array)) {
-                            // APP-1554: was max($this->data_mesgs['record']['timestamp']) + 1 -- an
-                            // O(n) scan per record, so O(n^2) per parse. The running maximum is
-                            // equivalent because the array is appended at one place only, just below.
-                            $timestamp = $max_record_timestamp !== null ? $max_record_timestamp + 1 : 0;
-                            if ($compressedTimestamp) {
-                                if ($previousTS === 0) {
-                                    // This should not happen! Throw exception?
-                                } else {
-                                    $previousTS -= FIT_UNIX_TS_DIFF; // back to FIT timestamps epoch
-                                    $fiveLsb = $previousTS & 0x1F;
-                                    if ($tsOffset >= $fiveLsb) {
-                                        // No rollover
-                                        $timestamp = $previousTS - $fiveLsb + $tsOffset;
-                                    } else {
-                                        // Rollover
-                                        $timestamp = $previousTS - $fiveLsb  + $tsOffset + 32;
-                                    }
-                                    $timestamp += FIT_UNIX_TS_DIFF; // back to Unix timestamps epoch
-                                    $previousTS += FIT_UNIX_TS_DIFF;
-                                }
-                            } else {
-                                if (isset($tmp_record_array['timestamp'])) {
-                                    if ($tmp_record_array['timestamp'] > 0) {
-                                        $timestamp = $tmp_record_array['timestamp'];
-                                        $previousTS = $timestamp;
-                                    }
-                                    unset($tmp_record_array['timestamp']);
-                                }
-                            }
-
-                            $this->data_mesgs['record']['timestamp'][] = $timestamp;
-                            // Timestamps are not guaranteed monotonic (see OutOfOrderTimestampsError),
-                            // so track the maximum rather than assuming the last append is the largest.
-                            if ($max_record_timestamp === null || $timestamp > $max_record_timestamp) {
-                                $max_record_timestamp = $timestamp;
-                            }
-
-                            foreach ($tmp_dev_overrides as $native_name => $dev_override) {
-                                $this->dev_override_streams[$native_name][$timestamp] = $dev_override;
-                            }
-
-                            foreach ($tmp_record_array as $key => $value) {
-                                if ($value !== null) {
-                                    $this->data_mesgs['record'][$key][$timestamp] = $value;
-                                }
-                            }
-                        }
-
-                        if ($is_lap_mesg) {
-                            $this->padLapFields(++$lap_count, $lap_field_counts);
-                        }
-                        if ($is_session_mesg) {
-                            $this->recordSessionMessage($session_field_counts);
-                        }
-                    } else {
-                        $this->file_pointer += $this->defn_mesgs[$local_mesg_type]['total_size'];
-                    }
+                $this->readDataMessage($record_header_byte & 0x0F, null);
             }
         }
-        // CX-87: the override used to be applied here by copying the developer field's bare value
-        // list over the native field under the DEVELOPER field's name. That was wrong three ways: it
-        // never ran (the option was forced off), it keyed the result by the developer name rather
-        // than the native one, and a list with one value fewer than there are records lined up with
-        // nothing. Values are now collected per record above and applied per session here; the
-        // declarations the override does not handle keep their old copy.
-        $this->applyDeveloperOverrides();
-        $this->copyUnhandledDeveloperDeclarations();
+    }
+
+    /**
+     * D00001275 Flexible & Interoperable Data Transfer (FIT) Protocol Rev 2.2.pdf
+     * Table 4-3. Definition Message Contents
+     */
+    private function readDefinitionMessage(int $local_mesg_type, bool $has_developer_data): void
+    {
+        $fixed = substr($this->file_contents, $this->file_pointer, 5);
+        if (strlen($fixed) < 5) {
+            throw new FitParseException('phpFITFileAnalysis->readDefinitionMessage(): file is truncated at offset ' . $this->file_pointer . '!');
+        }
+        // Byte 0 is reserved.
+        $architecture = ord($fixed[1]);
+        if ($architecture > 1) {
+            throw new FitParseException('phpFITFileAnalysis->readDefinitionMessage(): unknown architecture ' . $architecture . ' at offset ' . $this->file_pointer . '!');
+        }
+        $global_mesg_num = unpack($architecture === 0 ? 'v' : 'n', substr($fixed, 2, 2))[1];
+        $num_fields = ord($fixed[4]);
+        $this->file_pointer += 5;
+
+        $field_definitions = $this->readFieldDefinitions($num_fields, 'base_type');
+        $total_size = array_sum(array_column($field_definitions, 'size'));
+
+        $num_dev_fields = 0;
+        $dev_field_definitions = [];
+        if ($has_developer_data) {
+            $num_dev_fields = ord(substr($this->file_contents, $this->file_pointer, 1));
+            $this->file_pointer++;
+            $dev_field_definitions = $this->readFieldDefinitions($num_dev_fields, 'developer_data_index');
+            $total_size += array_sum(array_column($dev_field_definitions, 'size'));
+        }
+
+        $definition = [
+            'global_mesg_num' => $global_mesg_num,
+            'architecture' => $architecture,
+            'num_fields' => $num_fields,
+            'field_defns' => $field_definitions,
+            'num_dev_fields' => $num_dev_fields,
+            'dev_field_definitions' => $dev_field_definitions,
+            'total_size' => $total_size
+        ];
+        $this->defn_mesgs_all[] = $definition;
+        $definition['plan'] = $this->compileDefinition($definition);
+        $this->defn_mesgs[$local_mesg_type] = $definition;
+    }
+
+    /**
+     * $count triples of field definition number, size, and $third (a native field's base type, or
+     * a developer field's developer data index).
+     */
+    private function readFieldDefinitions(int $count, string $third): array
+    {
+        $bytes = substr($this->file_contents, $this->file_pointer, $count * 3);
+        if (strlen($bytes) < $count * 3) {
+            throw new FitParseException('phpFITFileAnalysis->readFieldDefinitions(): file is truncated at offset ' . $this->file_pointer . '!');
+        }
+        $this->file_pointer += $count * 3;
+
+        $definitions = [];
+        for ($i = 0; $i < $count; ++$i) {
+            $definitions[] = [
+                'field_definition_number' => ord($bytes[$i * 3]),
+                'size' => ord($bytes[$i * 3 + 1]),
+                $third => ord($bytes[$i * 3 + 2]),
+            ];
+        }
+
+        return $definitions;
+    }
+
+    /**
+     * D00001275 Flexible & Interoperable Data Transfer (FIT) Protocol Rev 2.2.pdf
+     * 4.2 Data Messages
+     *
+     * @param int|null $time_offset the 5-bit offset of a compressed timestamp header, else null
+     */
+    private function readDataMessage(int $local_mesg_type, ?int $time_offset): void
+    {
+        if (!isset($this->defn_mesgs[$local_mesg_type])) {
+            // Without its definition the message's size is unknown, so nothing after it can be read.
+            throw new FitParseException('phpFITFileAnalysis->readDataMessage(): data message for undefined local message type ' . $local_mesg_type . ' at offset ' . ($this->file_pointer - 1) . '!');
+        }
+        $definition = $this->defn_mesgs[$local_mesg_type];
+        $start = $this->file_pointer;
+        if (strlen($this->file_contents) < $start + $definition['total_size']) {
+            throw new FitParseException('phpFITFileAnalysis->readDataMessage(): file is truncated at offset ' . $start . '!');
+        }
+        $this->file_pointer += $definition['total_size'];
+
+        $global_mesg_num = $definition['global_mesg_num'];
+        $architecture = $definition['architecture'];
+        $mesg_info = $this->data_mesg_info[$global_mesg_num] ?? null;
+
+        // Native fields, raw. The timestamp (253) is read from every message, known or not: it is
+        // the reference a later compressed timestamp header counts from.
+        $raw_values = [];
+        $base_types = [];
+        $timestamp = null;  // FIT epoch
+        $plan = $definition['plan'];
+        $unpacked = $plan['format'] !== '' ? unpack($plan['format'], $this->file_contents, $start) : [];
+        foreach ($plan['fields'] as [$number, $kind, $key, $count, $base_type, $field_pos, $size]) {
+            if ($kind === 'n') {
+                if ($count === 1) {
+                    $values = [$unpacked[$key]];
+                } else {
+                    $values = [];
+                    for ($j = 1; $j <= $count; ++$j) {
+                        $values[] = $unpacked[$key . $j];
+                    }
+                }
+                $value = $this->checkValues($values, $base_type);
+                // hr (132) arrays line up element by element with the message's other arrays (beats
+                // with their times): one with no valid element keeps its slots.
+                if ($value === null && $count > 1 && $global_mesg_num === 132) {
+                    $value = array_fill(0, $count, null);
+                }
+            } elseif ($kind === 's') {
+                $value = self::cleanString(substr($this->file_contents, $start + $field_pos, $size));
+            } else {
+                $value = null;
+            }
+            if ($number === 253 && is_int($value)) {
+                $timestamp = $value;
+            }
+            if (isset($mesg_info['field_defns'][$number])) {
+                $raw_values[$number] = $value;
+                $base_types[$number] = $base_type;
+            }
+        }
+        $pos = $start + $plan['native_size'];  // developer fields follow the native ones
+
+        // The header's 5-bit offset counts on from the last timestamp of any message, rolling over
+        // every 32 s; the result is this message's timestamp and the reference for the next one.
+        $has_compressed_timestamp = false;
+        if ($time_offset !== null && $this->last_timestamp !== null) {
+            $timestamp = $this->last_timestamp - ($this->last_timestamp & 0x1F) + $time_offset;
+            if ($time_offset < ($this->last_timestamp & 0x1F)) {
+                $timestamp += 32;
+            }
+            $has_compressed_timestamp = true;
+        }
+        if ($timestamp !== null) {
+            $this->last_timestamp = $timestamp;
+        }
+
+        if ($mesg_info === null) {
+            return;  // Unknown message: skipped (pointer already advanced past it).
+        }
+        $mesg_name = $mesg_info['mesg_name'];
+
+        if ($global_mesg_num === 206) {
+            $this->storeFieldDescription($mesg_info, $raw_values);
+        }
+
+        // Developer fields: description, raw value as decoded, and the value with the description's
+        // scale/offset applied (null when invalid).
+        $dev_values = [];
+        $undescribed = [];  // [index, number, pos, size] of fields with no description yet
+        foreach ($definition['dev_field_definitions'] as $field_defn) {
+            if (!isset($this->data_mesgs['developer_data'])) {
+                $this->data_mesgs['developer_data'] = [];
+            }
+            $description = $this->dev_field_descriptions[$field_defn['developer_data_index']][$field_defn['field_definition_number']] ?? null;
+            if ($description !== null && isset($description['field_name'])) {
+                $dev_values[] = $this->developerValues($description, $field_defn['size'], $pos, $architecture);
+            } elseif ($global_mesg_num === 20) {
+                $undescribed[] = [$field_defn['developer_data_index'], $field_defn['field_definition_number'], $pos, $field_defn['size']];
+            }
+            $pos += $field_defn['size'];
+        }
+
+        if ($global_mesg_num === 206) {
+            return;
+        }
+
+        // A record keys its values by the compressed timestamp itself (storeRecord()); any other
+        // message gets it as its timestamp field.
+        if ($has_compressed_timestamp && $global_mesg_num !== 20 && isset($mesg_info['field_defns'][253])) {
+            $raw_values[253] = $timestamp;
+        }
+        $named = $this->namedValues($global_mesg_num, $mesg_info, $raw_values, $base_types);
+
+        if ($global_mesg_num === 20) {
+            $record_timestamp = $this->storeRecord($named, $raw_values, $timestamp, $has_compressed_timestamp, $dev_values);
+            // A record's developer field written before its field_description is decoded when the
+            // description arrives (storeFieldDescription()), so an override still covers it.
+            if ($record_timestamp !== null) {
+                foreach ($undescribed as [$index, $number, $field_pos, $size]) {
+                    $this->undescribed_dev_values[$index][$number][] = [$field_pos, $size, $architecture, $record_timestamp];
+                }
+            }
+            return;
+        }
+
+        $padded = !in_array($mesg_name, self::UNPADDED_MESSAGES, true);
+        if ($padded) {
+            $counts_before = array_map('count', $this->data_mesgs[$mesg_name] ?? []);
+            if ($mesg_name === 'session') {
+                foreach (self::ALWAYS_PRESENT_SESSION_FIELDS as $field_name) {
+                    $this->data_mesgs['session'][$field_name] ??= [];
+                }
+            }
+        }
+
+        foreach ($named as $name => [$value, $field_info]) {
+            // hr (132) arrays line up element by element with the message's other arrays, so an
+            // invalid element is kept as null, never dropped.
+            if (!$this->isValid($value) && !($global_mesg_num === 132 && is_array($value))) {
+                continue;
+            }
+            // Only the timestamp field (253) here. Any other date_time field -- course_point's field
+            // 1 is named timestamp too -- is shifted once, by its type, in fixData().
+            if (($field_info['num'] ?? null) === 253 && !$this->garmin_timestamps) {
+                $value += self::FIT_UNIX_TS_DIFF;
+            }
+            $value = $this->scale($value, $field_info);
+            $this->data_mesgs[$mesg_name][$name][] = $value;
+        }
+
+        // hr (132): each message's own beats and times, kept together for processHrMessages(). A
+        // field the message carries is a list (one invalid value is [null]); null when it does not.
+        if ($global_mesg_num === 132) {
+            $list = fn($number) => array_key_exists($number, $raw_values)
+                ? (is_array($raw_values[$number]) ? $raw_values[$number] : [$raw_values[$number]])
+                : null;
+            $this->hr_messages[] = [
+                'timestamp' => isset($raw_values[253]) ? $raw_values[253] + ($this->garmin_timestamps ? 0 : self::FIT_UNIX_TS_DIFF) : null,
+                'event_timestamp' => $list(9),
+                'event_timestamp_12' => $list(10),
+                'filtered_bpm' => $list(6) ?? [],
+            ];
+        }
+
+        // A padded message's developer values are stored at its index (padDeveloperValues() fills
+        // in the messages without one), so by_mesg[$mesg_name][i] is message i's value.
+        $index = $padded ? ($this->message_counts[$mesg_name] ?? 0) : null;
+        foreach ($dev_values as [$description, $raw, $value]) {
+            $this->storeDeveloperValue($description, $raw, $value, $mesg_name, null, $index);
+        }
+
+        if ($padded) {
+            $this->message_counts[$mesg_name] = $index + 1;
+            $this->padMessageFields($mesg_name, $index + 1, $counts_before);
+        }
+    }
+
+    /**
+     * After reading: each padded message's developer values as a list with one entry per message,
+     * null for a message without the field.
+     */
+    private function padDeveloperValues(): void
+    {
+        foreach ($this->data_mesgs['developer_data'] ?? [] as $name => $developer_field) {
+            foreach ($developer_field['by_mesg'] ?? [] as $mesg_name => $values) {
+                $count = $this->message_counts[$mesg_name] ?? null;
+                if ($mesg_name === 'record' || $count === null) {
+                    continue;
+                }
+                $values += array_fill(0, $count, null);
+                ksort($values);
+                $this->data_mesgs['developer_data'][$name]['by_mesg'][$mesg_name] = $values;
+            }
+        }
+    }
+
+    /**
+     * A record (20) message: every field is keyed by the record's timestamp. A record without one
+     * (and no compressed timestamp) goes one second after the latest record so far. Returns the
+     * timestamp it is stored at, or null when there was nothing to store.
+     */
+    private function storeRecord(array $named, array $raw_values, ?int $timestamp, bool $has_compressed_timestamp, array $dev_values): ?int
+    {
+        $values = [];
+        foreach ($named as $name => [$value, $field_info]) {
+            if ($name !== 'timestamp' && $this->isValid($value)) {
+                $values[$name] = $this->scale($value, $field_info);
+            }
+        }
+        // Not even a timestamp: nothing to store (a compressed timestamp alone does not count).
+        if ($values === [] && !(isset($raw_values[253]) && $this->isValid($raw_values[253]))) {
+            return null;
+        }
+
+        $shift = $this->garmin_timestamps ? 0 : self::FIT_UNIX_TS_DIFF;
+        // APP-1554: was max($this->data_mesgs['record']['timestamp']) + 1 -- an O(n) scan per record,
+        // so O(n^2) per parse. The running maximum is equivalent because the array is appended at
+        // one place only, just below.
+        $record_timestamp = $this->max_record_timestamp !== null ? $this->max_record_timestamp + 1 : 0;
+        if ($timestamp !== null && ($has_compressed_timestamp || $timestamp + $shift > 0)) {
+            $record_timestamp = $timestamp + $shift;
+        }
+
+        $this->data_mesgs['record']['timestamp'][] = $record_timestamp;
+        // Timestamps are not guaranteed monotonic (see OutOfOrderTimestampsError), so track the
+        // maximum rather than assuming the last append is the largest.
+        if ($this->max_record_timestamp === null || $record_timestamp > $this->max_record_timestamp) {
+            $this->max_record_timestamp = $record_timestamp;
+        }
+
+        foreach ($values as $key => $value) {
+            $this->data_mesgs['record'][$key][$record_timestamp] = $value;
+        }
+
+        foreach ($dev_values as [$description, $raw, $value]) {
+            $this->storeDeveloperValue($description, $raw, $value, 'record', $record_timestamp);
+        }
+
+        return $record_timestamp;
+    }
+
+    /**
+     * A message's values by name, each [raw value, field info]: its native fields, then -- as the
+     * FIT SDK decoder does -- each subfield whose reference field holds a value its map names
+     * ('expand_subfields', default on), and the fields a field's components expand into
+     * ('expand_components': default false, none; 'enhanced' only into enhanced_* fields such as
+     * speed into enhanced_speed; true for all). A component never replaces a field the
+     * message carries itself; its value is already scaled (info scale 1, offset 0).
+     */
+    private function namedValues(int $global_mesg_num, array $mesg_info, array $raw_values, array $base_types): array
+    {
+        $fields = $mesg_info['field_defns'];
+        $named = [];
+        foreach ($raw_values as $number => $value) {
+            $named[$fields[$number]['field_name']] = [$value, $fields[$number]];
+        }
+
+        $to_expand = [];
+        $mode = $this->options['expand_components'];
+        foreach ($raw_values as $number => $value) {
+            $info = $fields[$number];
+            if ($value === null || (!isset($info['subfields']) && !isset($info['components']) && !isset($info['accumulate_from']))
+                || (is_array($value) && !$this->isValid($value))) {
+                continue;
+            }
+            // Accumulators only move when every component is expanded (no enhanced_* target accumulates).
+            if ($mode === true && isset($info['accumulate_from']) && is_int($value)) {
+                // Carried outright: re-seed its accumulator, in the component's units.
+                [$scale, $offset] = $info['accumulate_from'];
+                $seed = (int) round(($value / $info['scale'] - $info['offset'] + $offset) * $scale);
+                $this->accumulators[$global_mesg_num][$number] = [$seed, $seed];
+            }
+            if (isset($info['subfields']) && $this->options['expand_subfields']) {
+                foreach ($info['subfields'] as $subfield) {
+                    foreach ($subfield['map'] as [$reference, $reference_value]) {
+                        if (($raw_values[$reference] ?? null) === $reference_value) {
+                            $named[$subfield['field_name']] ??= [$value, $subfield];
+                            if (isset($subfield['components'])) {
+                                $to_expand[] = [$value, $subfield, $base_types[$number]];
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            if (isset($info['components'])) {
+                $to_expand[] = [$value, $info, $base_types[$number]];
+            }
+        }
+
+        if ($mode === false || $to_expand === []) {
+            return $named;
+        }
+        $expanded = [];
+        while ([$value, $info, $base_type] = array_shift($to_expand)) {
+            // A single integer is read by shifting (speed into enhanced_speed is one 16-bit read on
+            // every record); an array through a bit stream.
+            $element_bits = (self::BASE_TYPES[$base_type]['bytes'] ?? 1) * 8;
+            $bits = is_int($value) && $element_bits < 64 ? null : new FitBitStream($value, $element_bits);
+            $shift = 0;
+            foreach ($info['components'] as [$target, $width, $scale, $offset]) {
+                if ($bits === null) {
+                    if ($element_bits - $shift < $width) {
+                        break;
+                    }
+                    $component = ($value >> $shift) & ((1 << $width) - 1);
+                    $shift += $width;
+                } elseif ($bits->available() < $width) {
+                    break;
+                } else {
+                    $component = $bits->read($width);
+                }
+                $target_info = $fields[$target] ?? null;
+                $target_name = $target_info['field_name'] ?? null;
+                if ($target_info === null || ($mode !== true && strpos($target_name, 'enhanced_') !== 0)
+                    || (isset($named[$target_name]) && $this->isValid($named[$target_name][0]) && !isset($expanded[$target_name]))) {
+                    continue;
+                }
+                if (!empty($target_info['accumulated'])) {
+                    $component = $this->accumulate($global_mesg_num, $target, $component, $width);
+                }
+                $expanded[$target_info['field_name']][] = $component / $scale - $offset;
+                $named[$target_info['field_name']] = [null, ['field_name' => $target_info['field_name'], 'scale' => 1, 'offset' => 0]];
+                if (isset($target_info['components'])) {
+                    $to_expand[] = [(int) round(($component / $scale - $offset + $target_info['offset']) * $target_info['scale']), $target_info, $target_info['base_type'] ?? 0x86];
+                }
+            }
+        }
+        foreach ($expanded as $name => $values) {
+            $named[$name][0] = count($values) === 1 ? $values[0] : $values;
+        }
+
+        return $named;
+    }
+
+    /**
+     * FIT SDK accumulator: a component carrying the low $bits of a running total (cycles, distance,
+     * power, ...) adds what it moved on by, modulo 2^$bits, to that field's total so far.
+     */
+    private function accumulate(int $global_mesg_num, int $field_num, int $value, int $bits): int
+    {
+        [$total, $last] = $this->accumulators[$global_mesg_num][$field_num] ?? [$value, $value];
+        $total += ($value - $last) & ((1 << $bits) - 1);
+        $this->accumulators[$global_mesg_num][$field_num] = [$total, $value];
+
+        return $total;
+    }
+
+    /**
+     * A field_description (206) message describes a developer field for later messages. It is kept
+     * aside, not stored in data_mesgs.
+     */
+    private function storeFieldDescription(array $mesg_info, array $raw_values): void
+    {
+        $description = [];
+        foreach ($raw_values as $number => $value) {
+            if ($this->isValid($value)) {
+                $description[$mesg_info['field_defns'][$number]['field_name']] = $value;
+            }
+        }
+        if (!isset($description['developer_data_index'], $description['field_definition_number'])) {
+            return;
+        }
+        $developer_data_index = $description['developer_data_index'];
+        $field_definition_number = $description['field_definition_number'];
+        unset($description['developer_data_index'], $description['field_definition_number']);
+        if (isset($description['field_name'])) {
+            $description['field_name'] = strtolower($description['field_name']);
+        }
+        if (isset($description['units'])) {
+            $description['units'] = strtolower($description['units']);
+        }
+        $this->dev_field_descriptions[$developer_data_index][$field_definition_number] = $description;
+
+        // Records that carried this field before it was described (see readDataMessage()).
+        if (isset($description['field_name'])) {
+            foreach ($this->undescribed_dev_values[$developer_data_index][$field_definition_number] ?? [] as [$pos, $size, $architecture, $record_timestamp]) {
+                [, $raw, $value] = $this->developerValues($description, $size, $pos, $architecture);
+                $this->storeDeveloperValue($description, $raw, $value, 'record', $record_timestamp);
+            }
+        }
+        unset($this->undescribed_dev_values[$developer_data_index][$field_definition_number]);
+    }
+
+    /**
+     * A developer field's [description, raw value as decoded, value with the description's
+     * scale/offset applied (null when invalid)]. The bytes are unpacked once; checkValues() makes
+     * the raw value (invalid kept) and the checked one from the same list.
+     *
+     * A value is an int or float, a string, an array when the field holds several values, or null.
+     * Signed types are sign-extended. In the checked value invalid values are null -- per element
+     * in an array, and the whole field when every element is invalid. Null too for an unknown base
+     * type or a size the type does not divide. Native fields go through compileDefinition().
+     */
+    private function developerValues(array $description, int $size, int $pos, int $architecture): array
+    {
+        $base_type = $description['fit_base_type_id'] ?? null;
+        if ($base_type === self::BASE_TYPE_STRING) {
+            $string = self::cleanString(substr($this->file_contents, $pos, $size));
+
+            return [$description, $string, $this->developerValueOrNull($description, $string)];
+        }
+        $type = self::BASE_TYPES[$base_type] ?? null;
+        if ($type === null || $size === 0 || $size % $type['bytes'] !== 0) {
+            return [$description, null, null];
+        }
+        $count = intdiv($size, $type['bytes']);
+        $values = array_values(unpack(($architecture === 1 ? $type['be'] : $type['le']) . $count, $this->file_contents, $pos));
+
+        return [
+            $description,
+            $this->checkValues($values, $base_type, true),
+            $this->developerValueOrNull($description, $this->checkValues($values, $base_type)),
+        ];
+    }
+
+    /**
+     * developer_data[name]: 'units', 'data' (every raw value in file order, kept as it always was:
+     * one flat list across records, laps and every other message, so its index is no message's
+     * index -- use by_mesg for that), and 'by_mesg' (per message name, the scaled value or null when
+     * invalid; keyed by timestamp for records, by message index for padded messages, in order
+     * otherwise). Two fields of one name in one padded message (two apps' "power"): the first
+     * valid value is kept, so the message still has one entry.
+     */
+    private function storeDeveloperValue(array $description, mixed $raw, mixed $value, string $mesg_name, ?int $record_timestamp, ?int $mesg_index = null): void
+    {
+        $name = $description['field_name'];
+        $this->data_mesgs['developer_data'][$name]['units'] = $description['units'] ?? null;
+        $this->data_mesgs['developer_data'][$name]['data'][] = $raw;
+        if ($record_timestamp !== null) {
+            $this->data_mesgs['developer_data'][$name]['by_mesg'][$mesg_name][$record_timestamp] = $value;
+        } elseif ($mesg_index !== null) {
+            if (!isset($this->data_mesgs['developer_data'][$name]['by_mesg'][$mesg_name][$mesg_index])) {
+                $this->data_mesgs['developer_data'][$name]['by_mesg'][$mesg_name][$mesg_index] = $value;
+            }
+        } else {
+            $this->data_mesgs['developer_data'][$name]['by_mesg'][$mesg_name][] = $value;
+        }
+
+        // CX-87: a record's value for the native field it replaces. The first declarer with a valid
+        // value on a record wins; null marks a record that carried the field invalid.
+        if ($mesg_name === 'record' && $record_timestamp !== null) {
+            $native = $this->nativeRecordFieldOverriddenBy($description);
+            if ($native !== null && !isset($this->dev_override_streams[$native][$record_timestamp])) {
+                $this->dev_override_streams[$native][$record_timestamp] = is_int($value) || is_float($value) ? $value : null;
+            }
+        }
+    }
+
+    /**
+     * Unpacked values of one field (a list) made into the field's value; see developerValues(). A
+     * float's invalid value (all ones) unpacks to NaN, and any NaN is no value.
+     */
+    private function checkValues(array $values, int $base_type, bool $keep_invalid = false): mixed
+    {
+        $type = self::BASE_TYPES[$base_type];
+        $count = count($values);
+
+        if ($base_type === self::BASE_TYPE_BYTE) {
+            if (!$keep_invalid && count(array_keys($values, 0xFF, true)) === $count) {
+                return null;
+            }
+
+            return $count === 1 ? $values[0] : $values;
+        }
+
+        $any_valid = false;
+        $sign_bits = $type['sign_bits'];
+        foreach ($values as &$value) {
+            if (($type['float'] ?? false) ? is_nan($value) : $value === $type['invalid']) {
+                if (!$keep_invalid) {
+                    $value = null;
+                    continue;
+                }
+            } elseif ($sign_bits && $value >= 1 << ($sign_bits - 1)) {
+                $value -= 1 << $sign_bits;
+            } elseif (($base_type === self::BASE_TYPE_UINT64 || $base_type === self::BASE_TYPE_UINT64Z) && $value < 0) {
+                $value += 18446744073709551616.0;  // beyond PHP_INT_MAX: as float
+            }
+            $any_valid = true;
+        }
+        unset($value);
+
+        if (!$any_valid) {
+            return null;
+        }
+
+        return $count === 1 ? $values[0] : $values;
+    }
+
+    /**
+     * A definition's native fields as one unpack() call, compiled when the definition is read: each
+     * field this library decodes (in the profile, or 253, read from every message) is [field number,
+     * kind ('n' numbers, 's' a string, null not decodable), unpack() key, count, base type, offset
+     * in the message, size].
+     */
+    private function compileDefinition(array $definition): array
+    {
+        $mesg_info = $this->data_mesg_info[$definition['global_mesg_num']] ?? null;
+        $format = [];
+        $fields = [];
+        $pos = 0;
+        foreach ($definition['field_defns'] as $i => $field_defn) {
+            $number = $field_defn['field_definition_number'];
+            $size = $field_defn['size'];
+            if ($number === 253 || isset($mesg_info['field_defns'][$number])) {
+                $base_type = $field_defn['base_type'];
+                $type = self::BASE_TYPES[$base_type] ?? null;
+                if ($base_type === self::BASE_TYPE_STRING) {
+                    $fields[] = [$number, 's', null, 0, $base_type, $pos, $size];
+                } elseif ($type !== null && $size > 0 && $size % $type['bytes'] === 0) {
+                    $count = intdiv($size, $type['bytes']);
+                    $key = 'f' . $i . '_';
+                    $format[] = '@' . $pos . '/' . ($definition['architecture'] === 1 ? $type['be'] : $type['le']) . $count . $key;
+                    $fields[] = [$number, 'n', $key, $count, $base_type, $pos, $size];
+                } else {
+                    $fields[] = [$number, null, null, 0, $base_type, $pos, $size];
+                }
+            }
+            $pos += $size;
+        }
+
+        return ['format' => implode('/', $format), 'fields' => $fields, 'native_size' => $pos];
+    }
+
+    /**
+     * A FIT string is null-terminated and UTF-8. The text up to the first null, with any invalid
+     * UTF-8 replaced; no HTML escaping, which is the caller's business. (It went through the
+     * deprecated FILTER_SANITIZE_STRING, which stripped tags and made "Steve's" "Steve&#39;s".)
+     */
+    private static function cleanString(string $data): string
+    {
+        $end = strpos($data, "\0");
+        if ($end !== false) {
+            $data = substr($data, 0, $end);
+        }
+
+        return mb_scrub($data, 'UTF-8');
+    }
+
+    /** A decoded value that is not null and, for an array, has at least one non-null element. */
+    private function isValid(mixed $value): bool
+    {
+        if (is_array($value)) {
+            foreach ($value as $element) {
+                if ($element !== null) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        return $value !== null;
+    }
+
+    /**
+     * D00001275 Flexible & Interoperable Data Transfer (FIT) Protocol Rev 1.7.pdf
+     * 4.4 Scale/Offset
+     * When specified, the binary quantity is divided by the scale factor and then the offset is
+     * subtracted, yielding a floating point quantity. Strings and nulls pass through.
+     */
+    private function scale(mixed $value, array $field_info): mixed
+    {
+        if (is_array($value)) {
+            foreach ($value as &$element) {
+                $element = $this->scale($element, $field_info);
+            }
+
+            return $value;
+        }
+        if (!is_int($value) && !is_float($value)) {
+            return $value;
+        }
+
+        return $value / $field_info['scale'] - $field_info['offset'];
+    }
+
+    /**
+     * A developer value (as checkValues() returns it, invalid already null) with the
+     * description's own scale/offset applied, or null when it is not a number (a float field can
+     * carry NaN other than the invalid pattern). Arrays element by element; strings pass through.
+     * A scale of 0 is not a usable scale and is read as 1 rather than dividing by it.
+     */
+    private function developerValueOrNull(array $description, mixed $value): mixed
+    {
+        if (is_array($value)) {
+            foreach ($value as &$element) {
+                $element = $this->developerValueOrNull($description, $element);
+            }
+
+            return $value;
+        }
+        if (!is_int($value) && !is_float($value)) {
+            return $value;
+        }
+        if (is_float($value) && !is_finite($value)) {
+            return null;
+        }
+        $scale = $description['scale'] ?? 1;
+
+        return $value / ($scale ?: 1) - ($description['offset'] ?? 0);
+    }
+
+    /**
+     * A developer field declaring a native field (native_field_num) is copied into the record
+     * stream under its own name when the record carries no field of that name, as this library has
+     * always done. The copy is developer_data's flat 'data' list, raw. Stryd's cadence on a watch
+     * without native cadence arrives this way, and athletica-app's FitFileParser::getMetricArray()
+     * reads such lists. A declaration the CX-87 override applied is not copied: its values are
+     * already in the native stream.
+     */
+    private function copyDeveloperDeclarations(): void
+    {
+        foreach ($this->dev_field_descriptions as $developer_data_index) {
+            foreach ($developer_data_index as $description) {
+                if (!isset($description['native_field_num'], $description['field_name'])) {
+                    continue;
+                }
+                if (isset($this->applied_overrides[$this->nativeRecordFieldOverriddenBy($description) ?? ''])) {
+                    continue;
+                }
+                if (isset($this->data_mesgs['record'][$description['field_name']])) {
+                    continue;
+                }
+                $this->data_mesgs['record'][$description['field_name']] = $this->data_mesgs['developer_data'][$description['field_name']]['data'] ?? [];
+            }
+        }
     }
 
     /**
@@ -1967,7 +2137,7 @@ class phpFITFileAnalysis
      * the reproducer), so promoting them would put a foreign value under the native name. They
      * stay in developer_data.
      */
-    private function nativeRecordFieldOverriddenBy(array $description)
+    private function nativeRecordFieldOverriddenBy(array $description): ?string
     {
         if (!$this->options['overwrite_with_dev_data']) {
             return null;
@@ -1980,46 +2150,26 @@ class phpFITFileAnalysis
     }
 
     /**
-     * CX-87: a developer value with its own scale/offset applied, or null when it is the type's
-     * invalid value or not a number (a float field's invalid value unpacks to NaN). A scale of 0 is
-     * not a usable scale and is read as 1 rather than dividing by it.
-     */
-    private function developerValueOrNull(array $description, $raw)
-    {
-        $base_type = $description['fit_base_type_id'] ?? null;
-        if ($base_type !== null && isset($this->invalid_values[$base_type]) && $raw === $this->invalid_values[$base_type]) {
-            return null;
-        }
-        if (is_float($raw) && !is_finite($raw)) {
-            return null;
-        }
-        $scale = $description['scale'] ?? 1;
-
-        return $raw / ($scale ?: 1) - ($description['offset'] ?? 0);
-    }
-
-    /**
      * CX-87: replace a native record field with the developer values that declare it, one session
      * at a time.
      *
      * A session is overridden only when the developer field carries at least one valid value inside
      * it. Within such a session every record carries the developer value or nothing -- never the
-     * watch's own value, because the two are not on one scale. That includes records written before
-     * the description (they carry no developer value) and, deliberately, the rest of a session after
-     * a pod drops out: a power-duration profile must come from one source, and missing samples
-     * leave a best unchanged where foreign ones would lift it. Outside an overridden session the
-     * native stream is untouched: a brick whose bike leg has a real power meter and no Stryd keeps
-     * that leg's power, and a file where Stryd never wrote a valid value (field installed, no pod
-     * paired) stays a watch-only file, stream and summary alike. A multi-session file whose sessions
-     * cannot be told apart is not overridden; copyUnhandledDeveloperDeclarations() then treats it as
-     * it always did.
+     * watch's own value, because the two are not on one scale. That includes, deliberately, the rest
+     * of a session after a pod drops out: a power-duration profile must come from one source, and
+     * missing samples leave a best unchanged where foreign ones would lift it. Outside an overridden
+     * session the native stream is untouched: a brick whose bike leg has a real power meter and no
+     * Stryd keeps that leg's power, and a file where Stryd never wrote a valid value (field
+     * installed, no pod paired) stays a watch-only file, stream and summary alike. A multi-session
+     * file whose sessions cannot be told apart is not overridden; copyDeveloperDeclarations() then
+     * treats it as it always did.
      *
      * The session's and its laps' avg_/max_ (and normalized_power for power) are then re-derived
      * from the stream that survives, rounded to whole units as the device writes them.
      */
-    private function applyDeveloperOverrides()
+    private function applyDeveloperOverrides(): void
     {
-        if (empty($this->dev_override_streams) || empty($this->data_mesgs['record']['timestamp'])) {
+        if ($this->dev_override_streams === [] || empty($this->data_mesgs['record']['timestamp'])) {
             return;
         }
 
@@ -2027,7 +2177,7 @@ class phpFITFileAnalysis
         if ($sessions === null) {
             return;
         }
-        $timestamps = array_values(array_unique((array) $this->data_mesgs['record']['timestamp']));
+        $timestamps = array_values(array_unique($this->data_mesgs['record']['timestamp']));
         sort($timestamps);
 
         foreach ($this->dev_override_streams as $field => $dev_stream) {
@@ -2065,36 +2215,13 @@ class phpFITFileAnalysis
 
             foreach ($overridden as $session_index => [$from, $to]) {
                 if ($session_index >= 0) {
-                    $this->summariseSession($session_index, $field, $this->keysInWindow($keys, $from, $to));
+                    $this->summariseMessage('session', $session_index, $field, $this->keysInWindow($keys, $from, $to));
                 }
                 foreach ($this->lapWindows($session_index, $from, $to) as $lap_index => $window) {
-                    $this->summariseLap($lap_index, $field, $window === null ? [] : $this->keysInWindow($keys, $window[0], $window[1]));
+                    $this->summariseMessage('lap', $lap_index, $field, $window === null ? [] : $this->keysInWindow($keys, $window[0], $window[1]));
                 }
             }
         }
-    }
-
-    /**
-     * CX-87: called after each session message is read. Session lists are not padded per message,
-     * so remember where this message's own values landed in each of them.
-     */
-    private function recordSessionMessage(array $counts_before)
-    {
-        $positions = [];
-        foreach ($this->data_mesgs['session'] ?? [] as $field => $values) {
-            if (count($values) > ($counts_before[$field] ?? 0)) {
-                $positions[$field] = $counts_before[$field] ?? 0;
-            }
-        }
-        $this->session_messages[] = $positions;
-    }
-
-    /** CX-87: this session message's own value of a session field, or null when it wrote none. */
-    private function sessionValue($session_index, $field)
-    {
-        $position = $this->session_messages[$session_index][$field] ?? null;
-
-        return $position === null ? null : ($this->data_mesgs['session'][$field][$position] ?? null);
     }
 
     /**
@@ -2104,16 +2231,16 @@ class phpFITFileAnalysis
      * message's own timestamp is not used as its end: the Stryd reproducer writes it equal to
      * start_time. Null when several sessions do not all carry a start_time in order.
      */
-    private function sessionWindows()
+    private function sessionWindows(): ?array
     {
-        $count = count($this->session_messages);
+        $count = $this->message_counts['session'] ?? 0;
         if ($count <= 1) {
             return [($count === 1 ? 0 : -1) => [PHP_INT_MIN, PHP_INT_MAX]];
         }
 
         $starts = [];
-        foreach (array_keys($this->session_messages) as $i) {
-            $start = $this->sessionValue($i, 'start_time');
+        for ($i = 0; $i < $count; ++$i) {
+            $start = $this->data_mesgs['session']['start_time'][$i] ?? null;
             if ($start === null || ($i > 0 && $start + $this->timestampShift() <= $starts[$i - 1])) {
                 return null;
             }
@@ -2135,21 +2262,19 @@ class phpFITFileAnalysis
      * which needs no timestamps; otherwise the laps whose start_time falls inside the session. A lap
      * runs until the next lap of the session starts.
      */
-    private function lapWindows($session_index, $from, $to)
+    private function lapWindows(int $session_index, int $from, int $to): array
     {
-        $starts = (array) ($this->data_mesgs['lap']['start_time'] ?? []);
-        $first = $session_index >= 0 ? $this->sessionValue($session_index, 'first_lap_index') : null;
-        $count = $session_index >= 0 ? $this->sessionValue($session_index, 'num_laps') : null;
+        $starts = $this->data_mesgs['lap']['start_time'] ?? [];
+        $first = $session_index >= 0 ? ($this->data_mesgs['session']['first_lap_index'][$session_index] ?? null) : null;
+        $count = $session_index >= 0 ? ($this->data_mesgs['session']['num_laps'][$session_index] ?? null) : null;
 
         if ($first !== null && $count !== null) {
             $laps = [];
             for ($i = $first; $i < $first + $count && array_key_exists($i, $starts); ++$i) {
                 $laps[$i] = $starts[$i] === null ? null : $starts[$i] + $this->timestampShift();
             }
-        } elseif ($session_index === -1 || count($this->session_messages) <= 1) {
-            $laps = array_map(function ($start) {
-                return $start === null ? null : $start + $this->timestampShift();
-            }, $starts);
+        } elseif (($this->message_counts['session'] ?? 0) <= 1) {
+            $laps = array_map(fn($start) => $start === null ? null : $start + $this->timestampShift(), $starts);
         } else {
             // A lap with no start_time goes with the timed lap before it.
             $laps = [];
@@ -2164,9 +2289,7 @@ class phpFITFileAnalysis
             }
         }
 
-        $timed = array_filter($laps, function ($start) {
-            return $start !== null;
-        });
+        $timed = array_filter($laps, fn($start) => $start !== null);
         $indexes = array_keys($timed);
         $windows = [];
         foreach ($laps as $i => $start) {
@@ -2186,13 +2309,13 @@ class phpFITFileAnalysis
     }
 
     /** CX-87: start_time is still raw (FIT epoch) here -- fixData() shifts it later -- while record timestamps are Unix. */
-    private function timestampShift()
+    private function timestampShift(): int
     {
-        return $this->garmin_timestamps ? 0 : FIT_UNIX_TS_DIFF;
+        return $this->garmin_timestamps ? 0 : self::FIT_UNIX_TS_DIFF;
     }
 
     /** CX-87: the values of a sorted list that fall in [from, to], found by binary search. */
-    private function keysInWindow(array $sorted, $from, $to)
+    private function keysInWindow(array $sorted, int $from, int $to): array
     {
         $lo = 0;
         $hi = count($sorted);
@@ -2214,12 +2337,14 @@ class phpFITFileAnalysis
     }
 
     /**
-     * CX-87: avg_/max_ (and normalized_power for power) of a field over the record values at
-     * $timestamps, rounded to whole units as the device writes them. Power-derived figures this
-     * library does not re-derive (training stress score, intensity factor, total work) come back
-     * null, since they describe the discarded stream; so does everything when no value survives.
+     * CX-87: overwrite one session's or lap's avg_/max_ (and normalized_power for power) of a field
+     * with figures from the record values at $timestamps, rounded to whole units as the device
+     * writes them. Power-derived figures this library does not re-derive (training stress score,
+     * intensity factor, total work) are set to null, since they describe the discarded stream; so is
+     * everything when no value survives. Both messages are padded one entry per message (APP-1788),
+     * so $index is the message's own entry; a field the file never wrote is not added.
      */
-    private function summarise($field, array $timestamps)
+    private function summariseMessage(string $mesg_name, int $index, string $field, array $timestamps): void
     {
         $values = [];
         foreach ($timestamps as $ts) {
@@ -2229,73 +2354,31 @@ class phpFITFileAnalysis
         }
 
         $summary = [
-            'avg_' . $field => count($values) ? (int) round(array_sum($values) / count($values)) : null,
-            'max_' . $field => count($values) ? (int) round(max($values)) : null,
+            'avg_' . $field => $values ? (int) round(array_sum($values) / count($values)) : null,
+            'max_' . $field => $values ? (int) round(max($values)) : null,
         ];
         if ($field === 'power') {
-            // Too short for one 30-sample rolling window: the mean is the closest figure, where the
-            // formula alone would give 0.
-            $np = count($values) ? $this->normalisedPower($values) : null;
+            // Too short for one 30-sample rolling window: the mean is the closest figure.
+            $np = $values ? $this->normalisedPower($values) : null;
             $summary['normalized_power'] = $np === null ? $summary['avg_power'] : (int) round($np);
             $summary['training_stress_score'] = null;
             $summary['intensity_factor'] = null;
             $summary['total_work'] = null;
         }
 
-        return $summary;
-    }
-
-    /** CX-87: overwrite the session message's own values, at the positions it wrote them. */
-    private function summariseSession($session_index, $field, array $timestamps)
-    {
-        foreach ($this->summarise($field, $timestamps) as $key => $value) {
-            $position = $this->session_messages[$session_index][$key] ?? null;
-            if ($position !== null) {
-                $this->data_mesgs['session'][$key][$position] = $value;
-            }
-        }
-    }
-
-    /** CX-87: overwrite one lap's values; lap fields are padded one entry per lap (APP-1788). */
-    private function summariseLap($lap_index, $field, array $timestamps)
-    {
-        foreach ($this->summarise($field, $timestamps) as $key => $value) {
-            if (isset($this->data_mesgs['lap'][$key]) && array_key_exists($lap_index, $this->data_mesgs['lap'][$key])) {
-                $this->data_mesgs['lap'][$key][$lap_index] = $value;
-            }
-        }
-    }
-
-    /**
-     * Before CX-87, a developer field declaring a native field was copied into the record stream
-     * under its own name whenever the record carried no field of that name (the option guarding a
-     * replacement was forced off). Stryd's cadence on a watch without native cadence arrives that
-     * way, and FitFileParser::getMetricArray() reads such sequential lists. Kept as it was for every
-     * declaration the CX-87 override did not apply: non-power fields, power with the option off, and
-     * power in a file the override left alone.
-     */
-    private function copyUnhandledDeveloperDeclarations()
-    {
-        foreach ($this->dev_field_descriptions as $developer_data_index) {
-            foreach ($developer_data_index as $description) {
-                if (!isset($description['native_field_num']) || isset($this->applied_overrides[$description['overrides_native'] ?? ''])) {
-                    continue;
-                }
-                if (isset($this->data_mesgs['record'][$description['field_name']])) {
-                    continue;
-                }
-                $this->data_mesgs['record'][$description['field_name']] = $this->data_mesgs['developer_data'][$description['field_name']]['data'] ?? [];
+        foreach ($summary as $key => $value) {
+            if (isset($this->data_mesgs[$mesg_name][$key]) && array_key_exists($index, $this->data_mesgs[$mesg_name][$key])) {
+                $this->data_mesgs[$mesg_name][$key][$index] = $value;
             }
         }
     }
 
     /**
      * Normalised Power over a power stream: 30-sample rolling mean, fourth power, mean, fourth root.
-     * Shared by powerMetrics() and the CX-87 summaries. Samples, not seconds: Stryd records every
-     * second, and powerMetrics() runs on the per-second stream that fixData() builds. Null when the
-     * stream is too short for a single rolling window.
+     * Samples, not seconds: powerMetrics() runs on the per-second stream that fixData() builds.
+     * Null when the stream is too short for a single rolling window.
      */
-    private function normalisedPower(array $power)
+    private function normalisedPower(array $power): ?float
     {
         $np_values = ($this->php_trader_ext_loaded) ? (trader_sma($power, 30) ?: []) : $this->sma($power, 30);
 
@@ -2310,27 +2393,29 @@ class phpFITFileAnalysis
     }
 
     /**
-     * APP-1788: keep every lap field one entry per lap message, so index $i is lap $i in all of them.
+     * APP-1788: keep every field of a PADDED_MESSAGES message one entry per message, so index $i
+     * is message $i in all of them.
      *
-     * readDataRecords() appends a lap field only when that lap carries a valid value for it, so a
+     * readDataMessage() appends a field only when that message carries a valid value for it, so a
      * field that is invalid (an HR strap dropping out) or absent (power only on a triathlon's bike
-     * leg) would otherwise leave its list shorter than the lap count, with every later value shifted
-     * onto the wrong lap. Called after each lap message: a field this lap did not write gets null,
-     * and a field first seen on this lap gets null for every earlier lap.
+     * leg) would otherwise leave its list shorter than the message count, with every later value
+     * shifted onto the wrong lap or session. Called after each such message: a field this message
+     * did not write gets null, and a field first seen on this message gets null for every earlier one.
      *
-     * @param int   $lap_count     laps read so far, including this one
-     * @param array $counts_before each lap field's length before this lap was read
+     * @param string $mesg_name     e.g. 'lap'
+     * @param int    $mesg_count    messages of that name read so far, including this one
+     * @param array  $counts_before each field's length before this message was read
      */
-    private function padLapFields($lap_count, array $counts_before)
+    private function padMessageFields(string $mesg_name, int $mesg_count, array $counts_before): void
     {
-        foreach ($this->data_mesgs['lap'] ?? [] as $field => $values) {
-            // Written in place, so a field this lap already filled is not copied (see APP-1554).
+        foreach ($this->data_mesgs[$mesg_name] ?? [] as $field => $values) {
+            // Written in place, so a field this message already filled is not copied (see APP-1554).
             $before = $counts_before[$field] ?? 0;
-            if ($before < $lap_count - 1) {
-                $this->data_mesgs['lap'][$field] = array_merge(array_fill(0, $lap_count - 1 - $before, null), $values);
+            if ($before < $mesg_count - 1) {
+                $this->data_mesgs[$mesg_name][$field] = array_merge(array_fill(0, $mesg_count - 1 - $before, null), $values);
             }
-            if (count($this->data_mesgs['lap'][$field]) < $lap_count) {
-                $this->data_mesgs['lap'][$field][] = null;
+            if (count($this->data_mesgs[$mesg_name][$field]) < $mesg_count) {
+                $this->data_mesgs[$mesg_name][$field][] = null;
             }
         }
     }
@@ -2338,128 +2423,39 @@ class phpFITFileAnalysis
     /**
      * If the user has requested for the data to be fixed, identify the missing keys for that data.
      */
-    private function fixData($options)
+    private function fixData(array $options): void
     {
-        // By default the constant FIT_UNIX_TS_DIFF will be added to timestamps, which have field type of date_time (or local_date_time).
-        // Timestamp fields (field number == 253) converted after being unpacked in $this->readDataRecords().
+        // By default self::FIT_UNIX_TS_DIFF will be added to timestamps, which have field type of date_time (or local_date_time).
+        // Timestamp fields (field number == 253) converted after being unpacked in readDataMessage(); the others,
+        // every field the profile types date_time or local_date_time, here.
         if (!$this->garmin_timestamps) {
-            $date_times = [
-                    ['message_name' => 'activity', 'field_name' => 'local_timestamp'],
-                    ['message_name' => 'course_point', 'field_name' => 'timestamp'],
-                    ['message_name' => 'file_id', 'field_name' => 'time_created'],
-                    ['message_name' => 'goal', 'field_name' => 'end_date'],
-                    ['message_name' => 'goal', 'field_name' => 'start_date'],
-                    ['message_name' => 'lap', 'field_name' => 'start_time'],
-                    ['message_name' => 'length', 'field_name' => 'start_time'],
-                    ['message_name' => 'monitoring', 'field_name' => 'local_timestamp'],
-                    ['message_name' => 'monitoring_info', 'field_name' => 'local_timestamp'],
-                    ['message_name' => 'obdii_data', 'field_name' => 'start_timestamp'],
-                    ['message_name' => 'schedule', 'field_name' => 'scheduled_time'],
-                    ['message_name' => 'schedule', 'field_name' => 'time_created'],
-                    ['message_name' => 'segment_lap', 'field_name' => 'start_time'],
-                    ['message_name' => 'session', 'field_name' => 'start_time'],
-                    ['message_name' => 'timestamp_correlation', 'field_name' => 'local_timestamp'],
-                    ['message_name' => 'timestamp_correlation', 'field_name' => 'system_timestamp'],
-                    ['message_name' => 'training_file', 'field_name' => 'time_created'],
-                    ['message_name' => 'video_clip', 'field_name' => 'end_timestamp'],
-                    ['message_name' => 'video_clip', 'field_name' => 'start_timestamp']
-                ];
-
-            foreach ($date_times as $date_time) {
-                if (isset($this->data_mesgs[$date_time['message_name']][$date_time['field_name']])) {
-                    if (is_array($this->data_mesgs[$date_time['message_name']][$date_time['field_name']])) {
-                        foreach ($this->data_mesgs[$date_time['message_name']][$date_time['field_name']] as &$element) {
-                            // APP-1788: lap fields hold null for a lap without a valid value.
+            foreach ($this->data_mesg_info as $mesg_info) {
+                $mesg_name = $mesg_info['mesg_name'];
+                if (!isset($this->data_mesgs[$mesg_name])) {
+                    continue;
+                }
+                foreach ($mesg_info['field_defns'] as $number => $field_info) {
+                    if ($number === 253 || !in_array($field_info['type'], ['date_time', 'local_date_time'], true)
+                        || !isset($this->data_mesgs[$mesg_name][$field_info['field_name']])) {
+                        continue;
+                    }
+                    $values = &$this->data_mesgs[$mesg_name][$field_info['field_name']];
+                    if (is_array($values)) {
+                        foreach ($values as &$element) {
+                            // APP-1788: padded fields hold null for a message without a valid value.
                             if ($element !== null) {
-                                $element += FIT_UNIX_TS_DIFF;
+                                $element += self::FIT_UNIX_TS_DIFF;
                             }
                         }
+                        unset($element);
                     } else {
-                        $this->data_mesgs[$date_time['message_name']][$date_time['field_name']] += FIT_UNIX_TS_DIFF;
+                        $values += self::FIT_UNIX_TS_DIFF;
                     }
+                    unset($values);
                 }
             }
         }
 
-
-        // Find messages that have been unpacked as unsigned integers that should be signed integers.
-        // http://php.net/manual/en/function.pack.php - signed integers endianness is always machine dependent.
-        // 131    s    signed short (always 16 bit, machine byte order)
-        // 133    l    signed long (always 32 bit, machine byte order)
-        // 142    q    signed long long (always 64 bit, machine byte order)
-        foreach ($this->defn_mesgs_all as $mesg) {
-            if (isset($this->data_mesg_info[$mesg['global_mesg_num']])) {
-                $mesg_name = $this->data_mesg_info[$mesg['global_mesg_num']]['mesg_name'];
-
-
-                foreach ($mesg['field_defns'] as $field) {
-                    // Convert uint16 to sint16
-                    if ($field['base_type'] === 131 && isset($this->data_mesg_info[$mesg['global_mesg_num']]['field_defns'][$field['field_definition_number']]['field_name'])) {
-                        $field_name = $this->data_mesg_info[$mesg['global_mesg_num']]['field_defns'][$field['field_definition_number']]['field_name'];
-                        if (isset($this->data_mesgs[$mesg_name][$field_name])) {
-                            if (is_array($this->data_mesgs[$mesg_name][$field_name])) {
-                                foreach ($this->data_mesgs[$mesg_name][$field_name] as &$v) {
-                                    if (PHP_INT_SIZE === 8 && $v > 0x7FFF) {
-                                        $v -= 0x10000;
-                                    }
-                                    if ($v > 0x7FFF) {
-                                        $v = -1 * ($v - 0x7FFF);
-                                    }
-                                }
-                            } elseif ($this->data_mesgs[$mesg_name][$field_name] > 0x7FFF) {
-                                if (PHP_INT_SIZE === 8) {
-                                    $this->data_mesgs[$mesg_name][$field_name] -= 0x10000;
-                                }
-                                $this->data_mesgs[$mesg_name][$field_name] = -1 * ($this->data_mesgs[$mesg_name][$field_name] - 0x7FFF);
-                            }
-                        }
-                    } // Convert uint32 to sint32
-                    elseif ($field['base_type'] === 133 && isset($this->data_mesg_info[$mesg['global_mesg_num']]['field_defns'][$field['field_definition_number']]['field_name'])) {
-                        $field_name = $this->data_mesg_info[$mesg['global_mesg_num']]['field_defns'][$field['field_definition_number']]['field_name'];
-                        if (isset($this->data_mesgs[$mesg_name][$field_name])) {
-                            if (is_array($this->data_mesgs[$mesg_name][$field_name])) {
-                                foreach ($this->data_mesgs[$mesg_name][$field_name] as &$v) {
-                                    if (PHP_INT_SIZE === 8 && $v > 0x7FFFFFFF) {
-                                        $v -= 0x100000000;
-                                    }
-                                    if ($v > 0x7FFFFFFF) {
-                                        $v = -1 * ($v - 0x7FFFFFFF);
-                                    }
-                                }
-                            } elseif ($this->data_mesgs[$mesg_name][$field_name] > 0x7FFFFFFF) {
-                                if (PHP_INT_SIZE === 8) {
-                                    $this->data_mesgs[$mesg_name][$field_name] -= 0x100000000;
-
-                                }
-                                if( $this->data_mesgs[$mesg_name][$field_name] > 0x7FFFFFFF ){
-                                    $this->data_mesgs[$mesg_name][$field_name] = -1 * ($this->data_mesgs[$mesg_name][$field_name] - 0x7FFFFFFF);
-                                }
-                            }
-                        }
-                    } // Convert uint64 to sint64
-                    elseif ($field['base_type'] === 142 && isset($this->data_mesg_info[$mesg['global_mesg_num']]['field_defns'][$field['field_definition_number']]['field_name'])) {
-                        $field_name = $this->data_mesg_info[$mesg['global_mesg_num']]['field_defns'][$field['field_definition_number']]['field_name'];
-                        if (isset($this->data_mesgs[$mesg_name][$field_name])) {
-                            if (is_array($this->data_mesgs[$mesg_name][$field_name])) {
-                                foreach ($this->data_mesgs[$mesg_name][$field_name] as &$v) {
-                                    if (PHP_INT_SIZE === 8 && $v > 0x7FFFFFFFFFFFFFFF) {
-                                        $v -= 0x10000000000000000;
-                                    }
-                                    if ($v > 0x7FFFFFFFFFFFFFFF) {
-                                        $v = -1 * ($v - 0x7FFFFFFFFFFFFFFF);
-                                    }
-                                }
-                            } elseif ($this->data_mesgs[$mesg_name][$field_name] > 0x7FFFFFFFFFFFFFFF) {
-                                if (PHP_INT_SIZE === 8) {
-                                    $this->data_mesgs[$mesg_name][$field_name] -= 0x10000000000000000;
-                                }
-                                $this->data_mesgs[$mesg_name][$field_name] = -1 * ($this->data_mesgs[$mesg_name][$field_name] - 0x7FFFFFFFFFFFFFFF);
-                            }
-                        }
-                    }
-                }
-            }
-        }
 
         // Remove duplicate timestamps and store original before interpolating
         if (isset($this->data_mesgs['record']['timestamp']) && is_array($this->data_mesgs['record']['timestamp'])) {
@@ -2467,28 +2463,17 @@ class phpFITFileAnalysis
             $this->data_mesgs['record']['timestamp_original'] = $this->data_mesgs['record']['timestamp'];
         }
 
+        // 'data_every_second' => 'false' is off, as false is.
+        $every_second = !empty($options['data_every_second']) && !(is_string($options['data_every_second']) && strtolower($options['data_every_second']) === 'false');
+
         // Return if no option set
-        if (empty($options['fix_data']) && empty($options['data_every_second'])) {
+        if (empty($options['fix_data']) && !$every_second) {
             return;
         }
 
-        if (!isset($this->data_mesgs['record'])) {
-            return;
-        }
-
-        // If $options['data_every_second'], then create timestamp array for every second from min to max
-        if (!empty($options['data_every_second']) && !(is_string($options['data_every_second']) && strtolower($options['data_every_second']) === 'false')) {
-            // If user has not specified the data to be fixed, assume all
-            if (empty($options['fix_data'])) {
-                $options['fix_data'] = ['all'];
-            }
-
-            $min_ts = min($this->data_mesgs['record']['timestamp']);
-            $max_ts = max($this->data_mesgs['record']['timestamp']);
-            unset($this->data_mesgs['record']['timestamp']);
-            for ($i=$min_ts; $i<=$max_ts; ++$i) {
-                $this->data_mesgs['record']['timestamp'][] = $i;
-            }
+        // If user has not specified the data to be fixed, assume all
+        if ($every_second && empty($options['fix_data'])) {
+            $options['fix_data'] = ['all'];
         }
 
         // Check if valid option(s) provided
@@ -2497,6 +2482,22 @@ class phpFITFileAnalysis
         });  // Make all lower-case.
         if (count(array_intersect(['all', 'cadence', 'distance', 'heart_rate', 'lat_lon', 'speed', 'power', 'altitude', 'enhanced_speed', 'enhanced_altitude'], $options['fix_data'])) === 0) {
             throw new \Exception('phpFITFileAnalysis->fixData(): option not valid!');
+        }
+
+        // No records, or one (its fields already unwrapped to values by oneElementArrays()): nothing
+        // to fill in. Checked after the options, which are invalid whatever the file.
+        if (!is_array($this->data_mesgs['record']['timestamp'] ?? null)) {
+            return;
+        }
+
+        // If $options['data_every_second'], then create timestamp array for every second from min to max
+        if ($every_second) {
+            $min_ts = min($this->data_mesgs['record']['timestamp']);
+            $max_ts = max($this->data_mesgs['record']['timestamp']);
+            unset($this->data_mesgs['record']['timestamp']);
+            for ($i=$min_ts; $i<=$max_ts; ++$i) {
+                $this->data_mesgs['record']['timestamp'][] = $i;
+            }
         }
 
         $bCadence = $bDistance = $bHeartRate = $bLatitudeLongitude = $bSpeed = $bPower = $bAltitude = $bEnhancedSpeed = $bEnhancedAltitude = false;
@@ -2638,7 +2639,7 @@ class phpFITFileAnalysis
         }
     }
 
-    private function filterPauseGapThreshold(&$paused_timestamps)
+    private function filterPauseGapThreshold(array &$paused_timestamps): void
     {
         $gap_threshold_seconds = 60;
         $i = 0;
@@ -2701,69 +2702,66 @@ class phpFITFileAnalysis
 
     /**
      * For the missing keys in the data, interpolate using values either side and insert as necessary.
+     *
+     * A run of missing keys between two recorded ones is filled evenly between their values (null
+     * throughout when the run starts paused); before the first or after the last recorded key, the
+     * edge value is repeated. $missing_keys must be ascending, as fixData() builds them.
+     *
+     * One forward pass. It used to rewind the array and walk it from the start for every run of
+     * missing keys -- O(records x gaps), seconds for a long ride with data_every_second.
      */
-    private function interpolateMissingData(&$missing_keys, &$array, $is_int, $paused_timestamps)
+    private function interpolateMissingData(array &$missing_keys, mixed &$array, bool $is_int, array $paused_timestamps): void
     {
-        if (!is_array($array)) {
+        if (!is_array($array) || $array === []) {
             return;  // Can't interpolate if not an array
         }
 
-        $num_points = 2;
-
-        $min_key = min(array_keys($array));
-        $max_key = max(array_keys($array));
+        ksort($array);
+        $keys = array_keys($array);
+        $min_key = $keys[0];
+        $max_key = $keys[count($keys) - 1];
         $count = count($missing_keys);
+        $next = 0;  // index in $keys of the first recorded key after the current missing one
 
-        for ($i=0; $i<$count; ++$i) {
+        for ($i = 0; $i < $count;) {
             $missing_timestamp = $missing_keys[$i];
-
-            if ($missing_timestamp !== 0) {
-                $is_paused_timestamp = isset($paused_timestamps[$missing_timestamp]) && $paused_timestamps[$missing_timestamp] === true;
-
-                // Interpolating outside recorded range is impossible - use edge values instead
-                if ($missing_timestamp > $max_key) {
-                    $array[$missing_timestamp] = $is_paused_timestamp ? null : $array[$max_key];
-                    continue;
-                } elseif ($missing_timestamp < $min_key) {
-                    $array[$missing_timestamp] = $is_paused_timestamp ? null : $array[$min_key];
-                    continue;
-                }
-
-                $prev_value = $next_value = reset($array);
-
-                while ($missing_timestamp > key($array)) {
-                    $prev_value = current($array);
-                    $next_value = next($array);
-                }
-                for ($j=$i+1; $j<$count; ++$j) {
-                    if ($missing_keys[$j] < key($array)) {
-                        $num_points++;
-                    } else {
-                        break;
-                    }
-                }
-
-                $gap = ($next_value - $prev_value) / $num_points;
-
-                for ($k=0; $k<=$num_points-2; ++$k) {
-                    $gap_value = null;
-
-                    if (!$is_paused_timestamp) {
-                        if ($is_int) {
-                            $gap_value = (int) round($prev_value + ($gap * ($k+1)));
-                        }  else {
-                            $gap_value = $prev_value + ($gap * ($k+1));
-                        }
-                    }
-
-                    $array[$missing_keys[$i+$k]] = $gap_value;
-                }
-                for ($k=0; $k<=$num_points-2; ++$k) {
-                    $missing_keys[$i+$k] = 0;
-                }
-
-                $num_points = 2;
+            if ($missing_timestamp === 0) {  // as before: 0 was the "done" marker, so never filled
+                ++$i;
+                continue;
             }
+            $is_paused_timestamp = isset($paused_timestamps[$missing_timestamp]) && $paused_timestamps[$missing_timestamp] === true;
+
+            // Interpolating outside recorded range is impossible - use edge values instead
+            if ($missing_timestamp > $max_key || $missing_timestamp < $min_key) {
+                $array[$missing_timestamp] = $is_paused_timestamp ? null : $array[$missing_timestamp > $max_key ? $max_key : $min_key];
+                ++$i;
+                continue;
+            }
+
+            while ($keys[$next] < $missing_timestamp) {
+                ++$next;
+            }
+            $next_key = $keys[$next];
+            $prev_value = $array[$keys[$next - 1]];
+            $next_value = $array[$next_key];
+
+            $run_end = $i + 1;
+            while ($run_end < $count && $missing_keys[$run_end] < $next_key) {
+                ++$run_end;
+            }
+            $gap = ($next_value - $prev_value) / ($run_end - $i + 1);
+
+            for ($k = 0; $k < $run_end - $i; ++$k) {
+                $gap_value = null;
+                if (!$is_paused_timestamp) {
+                    $gap_value = $prev_value + ($gap * ($k + 1));
+                    if ($is_int) {
+                        $gap_value = (int) round($gap_value);
+                    }
+                }
+                $array[$missing_keys[$i + $k]] = $gap_value;
+            }
+            $i = $run_end;
         }
 
         ksort($array);  // sort using keys
@@ -2772,7 +2770,7 @@ class phpFITFileAnalysis
     /**
      * Change arrays that contain only one element into non-arrays so you can use $variable rather than $variable[0] to access.
      */
-    private function oneElementArrays()
+    private function oneElementArrays(): void
     {
         foreach ($this->data_mesgs as $mesg_key => $mesg) {
             if ($mesg_key === 'developer_data') {
@@ -2788,41 +2786,83 @@ class phpFITFileAnalysis
     }
 
     /**
-     * The FIT protocol makes use of enumerated data types.
-     * Where these values have been identified in the FIT SDK, they have been included in $this->enum_data
-     * This function returns the enumerated value for a given message type.
+     * The FIT protocol makes use of enumerated data types. This returns the name of $value (or of
+     * each value in an array) in the enumerated type $type, or 'unknown'.
+     *
+     * $this->enum_data holds the names this library has always returned (some capitalised, see
+     * the comments there); any other value is named from the FIT SDK profile (Profile::TYPES) --
+     * every type there can be asked for, e.g. 'lap_trigger'. 'product' is the SDK's garmin_product.
      */
     public function enumData($type, $value)
     {
         if (is_array($value)) {
             $tmp = [];
             foreach ($value as $element) {
-                if (isset($this->enum_data[$type][$element])) {
-                    $tmp[] = $this->enum_data[$type][$element];
-                } else {
-                    $tmp[] = 'unknown';
-                }
+                $tmp[] = $this->enumData($type, $element);
             }
             return $tmp;
-        } else {
-            return isset($this->enum_data[$type][$value]) ? $this->enum_data[$type][$value] : 'unknown';
         }
+        if (!is_int($value) && !is_string($value)) {
+            return 'unknown';
+        }
+        if (isset($this->enum_data[$type][$value])) {
+            return $this->enum_data[$type][$value];
+        }
+        if ($type === 'product' && in_array($value, self::UNNAMED_PRODUCT_IDS, true)) {
+            return 'unknown';
+        }
+        $name = Profile::TYPES[self::ENUM_TYPE_ALIASES[$type] ?? $type][$value] ?? null;
+        if ($name === null) {
+            return 'unknown';
+        }
+
+        return in_array($type, self::CAPITALISED_ENUM_TYPES, true) ? ucfirst(str_replace('_', ' ', $name)) : $name;
     }
 
     /**
-     * Short-hand access to commonly used enumerated data.
+     * Short-hand access to commonly used enumerated data, for the device that created the file.
      */
     public function manufacturer()
     {
-        $tmp = $this->enumData('manufacturer', $this->data_mesgs['device_info']['manufacturer']);
-        return is_array($tmp) ? $tmp[0] : $tmp;
+        return $this->enumData('manufacturer', $this->creatorDeviceInfo('manufacturer'));
     }
+
+    /**
+     * The 'product' table is Garmin's product list (the SDK's garmin_product), and a product number
+     * means a Garmin product only when the manufacturer is Garmin, Dynastream (OEM) or Tacx; any
+     * other manufacturer's number is 'unknown' rather than some Garmin device's name.
+     */
     public function product()
     {
-        $tmp = $this->enumData('product', $this->data_mesgs['device_info']['product']);
-        return is_array($tmp) ? $tmp[0] : $tmp;
+        $manufacturer = $this->creatorDeviceInfo('manufacturer');
+        if ($manufacturer !== null && !in_array($manufacturer, self::GARMIN_PRODUCT_MANUFACTURERS, true)) {
+            return 'unknown';
+        }
+
+        return $this->enumData('product', $this->creatorDeviceInfo('product'));
     }
-    public function sport(int $index = null)
+
+    /**
+     * A device_info field of the device that created the file: the message for device_index 0
+     * (creator), else the first that names a manufacturer. device_info fields are one entry per
+     * message, so an index means the same device in every field.
+     */
+    private function creatorDeviceInfo(string $field): mixed
+    {
+        $device_info = $this->data_mesgs['device_info'] ?? [];
+        $as_list = fn($v) => is_array($v) ? array_values($v) : [$v];
+        $manufacturers = $as_list($device_info['manufacturer'] ?? null);
+        $device_indexes = $as_list($device_info['device_index'] ?? null);
+        $values = $as_list($device_info[$field] ?? null);
+
+        $index = array_search(0, $device_indexes, true);
+        if ($index === false || !isset($manufacturers[$index])) {
+            $index = array_key_first(array_filter($manufacturers, fn($m) => $m !== null));
+        }
+
+        return $index === null ? null : ($values[$index] ?? null);
+    }
+    public function sport(?int $index = null)
     {
         $tmp = $this->enumData('sport', $this->data_mesgs['session']['sport'] ?? ($this->data_mesgs['sport']['sport'] ?? 0));
 
@@ -2842,7 +2882,7 @@ class phpFITFileAnalysis
     /**
      * Transform the values read from the FIT file into the units requested by the user.
      */
-    private function setUnits($options)
+    private function setUnits(array $options): void
     {
         if (!empty($options['units'])) {
             // Handle $options['units'] not being passed as array and/or not in lowercase.
@@ -2883,6 +2923,7 @@ class phpFITFileAnalysis
         $m_ft_fields = [
                 'altitude',
                 'avg_altitude',
+                'enhanced_altitude',  // was missing: statute left the record's enhanced altitude in metres
                 'enhanced_avg_altitude',
                 'enhanced_max_altitude',
                 'enhanced_min_altitude',
@@ -2976,14 +3017,16 @@ class phpFITFileAnalysis
                                         continue;
                                     }
                                     if ($bPace) {
-                                        $value = round(60 / 2.23693629 / $value, 3);
+                                        // Standing still is no pace, as for metric (a division by zero).
+                                        $value = ($value != 0) ? round(60 / 2.23693629 / $value, 3) : 0;
                                     } else {
                                         $value = round($value * 2.23693629, 3);
                                     }
                                 }
                             } else {
                                 if ($bPace) {
-                                    $this->data_mesgs[$message][$field] = round(60 / 2.23693629 / $this->data_mesgs[$message][$field], 3);
+                                    $speed = $this->data_mesgs[$message][$field];
+                                    $this->data_mesgs[$message][$field] = ($speed != 0) ? round(60 / 2.23693629 / $speed, 3) : 0;
                                 } else {
                                     $this->data_mesgs[$message][$field] = round($this->data_mesgs[$message][$field] * 2.23693629, 3);
                                 }
@@ -3075,7 +3118,6 @@ class phpFITFileAnalysis
                     break;
                 default:
                     throw new \Exception('phpFITFileAnalysis->setUnits(): units option not valid!');
-                    break;
             }
         }
     }
@@ -3085,13 +3127,7 @@ class phpFITFileAnalysis
      */
     public function hrZonesMax($hr_maximum, $percentages_array = [0.60, 0.75, 0.85, 0.95])
     {
-        if (array_walk($percentages_array, function (&$value, $key, $hr_maximum) {
-            $value = round($value * $hr_maximum);
-        }, $hr_maximum)) {
-            return $percentages_array;
-        } else {
-            throw new \Exception('phpFITFileAnalysis->hrZonesMax(): cannot calculate zones, please check inputs!');
-        }
+        return array_map(fn($percentage) => round($percentage * $hr_maximum), $percentages_array);
     }
 
     /**
@@ -3099,13 +3135,7 @@ class phpFITFileAnalysis
      */
     public function hrZonesReserve($hr_resting, $hr_maximum, $percentages_array = [0.60, 0.65, 0.75, 0.82, 0.89, 0.94 ])
     {
-        if (array_walk($percentages_array, function (&$value, $key, $params) {
-            $value = round($params[0] + ($value * $params[1]));
-        }, [$hr_resting, $hr_maximum - $hr_resting])) {
-            return $percentages_array;
-        } else {
-            throw new \Exception('phpFITFileAnalysis->hrZonesReserve(): cannot calculate zones, please check inputs!');
-        }
+        return array_map(fn($percentage) => round($hr_resting + ($percentage * ($hr_maximum - $hr_resting))), $percentages_array);
     }
 
     /**
@@ -3113,17 +3143,12 @@ class phpFITFileAnalysis
      */
     public function powerZones($functional_threshold_power, $percentages_array = [0.55, 0.75, 0.90, 1.05, 1.20, 1.50])
     {
-        if (array_walk($percentages_array, function (&$value, $key, $functional_threshold_power) {
-            $value = round($value * $functional_threshold_power) + 1;
-        }, $functional_threshold_power)) {
-            return $percentages_array;
-        } else {
-            throw new \Exception('phpFITFileAnalysis->powerZones(): cannot calculate zones, please check inputs!');
-        }
+        return array_map(fn($percentage) => round($percentage * $functional_threshold_power) + 1, $percentages_array);
     }
 
     /**
      * Partition the data (e.g. cadence, heart_rate, power, speed) using thresholds provided as an array.
+     * A null (a paused second, with data_every_second) is no sample; it used to count in the lowest zone.
      */
     public function partitionData($record_field = '', $thresholds = null, $percentages = true, $labels_for_keys = true)
     {
@@ -3146,10 +3171,13 @@ class phpFITFileAnalysis
 
         $result = array_fill(0, count($thresholds)+1, 0);
 
-        foreach ($this->data_mesgs['record'][$record_field] as $value) {
+        foreach ((array) $this->data_mesgs['record'][$record_field] as $value) {
+            if ($value === null) {
+                continue;
+            }
             $key = 0;
             $count = count($thresholds);
-            for ($key; $key<$count; ++$key) {
+            for (; $key<$count; ++$key) {
                 if ($value < $thresholds[$key]) {
                     break;
                 }
@@ -3170,9 +3198,10 @@ class phpFITFileAnalysis
 
         if ($percentages === true) {
             $total = array_sum($result);
-            array_walk($result, function (&$value, $key, $total) {
-                $value = round($value / $total * 100, 1);
-            }, $total);
+            foreach ($result as &$value) {
+                $value = $total ? round($value / $total * 100, 1) : 0.0;
+            }
+            unset($value);
         }
 
         return $result;
@@ -3180,6 +3209,9 @@ class phpFITFileAnalysis
 
     /**
      * Split data into buckets/bins using a Counting Sort algorithm (http://en.wikipedia.org/wiki/Counting_sort) to generate data for a histogram plot.
+     * Buckets are keyed by their value: an int when whole, else a string (a float key would be
+     * truncated to an int -- deprecated since PHP 8.1, and wrong for a width such as 0.5). Nulls
+     * (paused seconds) are no samples.
      */
     public function histogram($bucket_width = 25, $record_field = '')
     {
@@ -3190,15 +3222,21 @@ class phpFITFileAnalysis
             throw new \Exception('phpFITFileAnalysis->histogram(): bucket width is not valid!');
         }
 
-        foreach ($this->data_mesgs['record'][$record_field] as $value) {
-            $key = round($value / $bucket_width) * $bucket_width;
-            isset($result[$key]) ? $result[$key]++ : $result[$key] = 1;
+        $bucket = fn($value) => ($value == (int) $value) ? (int) $value : (string) $value;
+        $result = [];
+        $max = 0;
+        foreach ((array) $this->data_mesgs['record'][$record_field] as $value) {
+            if ($value === null) {
+                continue;
+            }
+            $bucket_value = round($value / $bucket_width) * $bucket_width;
+            $max = max($max, $bucket_value);
+            $key = $bucket($bucket_value);
+            $result[$key] = ($result[$key] ?? 0) + 1;
         }
 
-        for ($i=0; $i<max(array_keys($result)) / $bucket_width; ++$i) {
-            if (!isset($result[$i * $bucket_width])) {
-                $result[$i * $bucket_width] = 0;
-            }
+        for ($i=0; $i<$max / $bucket_width; ++$i) {
+            $result[$bucket($i * $bucket_width)] ??= 0;
         }
 
         ksort($result);
@@ -3228,20 +3266,39 @@ class phpFITFileAnalysis
     /**
      * Simple moving average algorithm
      */
-    private function sma($array, $time_period)
+    private function sma(array $array, int|float|string $time_period): \Generator
     {
         $data = array_values($array);
-        $count = count($array);
+        $count = count($data);
+        $time_period = (int) $time_period;
+        if ($time_period < 1) {
+            return;
+        }
 
-        for ($i=0; $i<$count-$time_period; ++$i) {
-            $pieces = array_slice($data, $i, $time_period);
-
-            // if any of the values are 'null' we want to ignore this chunk since null values indicate pauses at that time
-            if (in_array(null, $pieces, true)) {
-                continue;
+        // A running sum and a count of the nulls inside the window: O(n), where slicing each window
+        // was O(n x period) -- a 3,600 s best effort over a four-hour ride is 50 million additions.
+        // Every window is yielded, the last included (it used to be dropped, so a period equal to
+        // the number of samples had no window at all).
+        $sum = 0;
+        $nulls = 0;
+        for ($i = 0; $i < $count; ++$i) {
+            if ($data[$i] === null) {
+                ++$nulls;
+            } else {
+                $sum += $data[$i];
             }
-
-            yield array_sum($pieces) / $time_period;
+            if ($i >= $time_period) {
+                $leaving = $data[$i - $time_period];
+                if ($leaving === null) {
+                    --$nulls;
+                } else {
+                    $sum -= $leaving;
+                }
+            }
+            // A window containing a null is skipped: null values indicate pauses at that time.
+            if ($i >= $time_period - 1 && $nulls === 0) {
+                yield $sum / $time_period;
+            }
         }
     }
 
@@ -3260,14 +3317,18 @@ class phpFITFileAnalysis
         } else {
             $gender_coeff = 1.92;
         }
-        foreach ($this->data_mesgs['record']['heart_rate'] as $hr) {
+        // A null is a paused second (fixData() with data_every_second): it is no sample. It used to
+        // count as 0 bpm -- a negative heart-rate reserve that took TRIMP down, and a zero in the mean.
+        // Each sample counts as one second, so with smart recording pass 'data_every_second'.
+        $heart_rates = array_filter((array) ($this->data_mesgs['record']['heart_rate'] ?? []), fn($hr) => $hr !== null);
+        foreach ($heart_rates as $hr) {
             // TRIMPexp formula from http://fellrnr.com/wiki/TRIMP
             // TRIMPexp = sum(D x HRr x 0.64ey)
             $temp_heart_rate = ($hr - $hr_resting) / ($hr_maximum - $hr_resting);
             $hr_metrics['TRIMPexp'] += ((1/60) * $temp_heart_rate * 0.64 * (exp($gender_coeff * $temp_heart_rate)));
         }
         $hr_metrics['TRIMPexp'] = round($hr_metrics['TRIMPexp']);
-        $hr_metrics['hrIF'] = round((array_sum($this->data_mesgs['record']['heart_rate'])/(count($this->data_mesgs['record']['heart_rate']))) / $hr_FT, 2);
+        $hr_metrics['hrIF'] = $heart_rates ? round((array_sum($heart_rates) / count($heart_rates)) / $hr_FT, 2) : 0.0;
 
         return $hr_metrics;
     }
@@ -3284,23 +3345,28 @@ class phpFITFileAnalysis
             throw new \Exception('phpFITFileAnalysis->powerMetrics(): power data not present in FIT file!');
         }
 
-        $non_null_power_records = array_filter($this->data_mesgs['record']['power'], function ($powerRecord) {
+        // Nulls are paused seconds (fixData() with data_every_second): no work, no time. kJ and TSS
+        // used to count them as seconds at average power. Each sample counts as one second, so with
+        // smart recording pass 'data_every_second'.
+        $power = (array) $this->data_mesgs['record']['power'];
+        $non_null_power_records = array_filter($power, function ($powerRecord) {
             return $powerRecord !== null;
         });
+        $samples = count($non_null_power_records);
 
-        $power_metrics['Average Power'] = array_sum($non_null_power_records) / count($non_null_power_records);
-        $power_metrics['Kilojoules'] = ($power_metrics['Average Power'] * count($this->data_mesgs['record']['power'])) / 1000;
+        $power_metrics['Average Power'] = $samples ? array_sum($non_null_power_records) / $samples : 0.0;
+        $power_metrics['Kilojoules'] = array_sum($non_null_power_records) / 1000;
 
-        $normalised_power = $this->normalisedPower($this->data_mesgs['record']['power']);
+        $normalised_power = $this->normalisedPower($power);
         if ($normalised_power === null) {
-            // Before CX-87 shared the formula this divided by zero; say why instead, as the no-power path does.
+            // Too short for one 30-sample window: this divided by zero; say why instead, as the no-power path does.
             throw new \Exception('phpFITFileAnalysis->powerMetrics(): too few power samples for normalised power!');
         }
         $power_metrics['Normalised Power'] = $normalised_power;
 
-        $power_metrics['Variability Index'] = $power_metrics['Normalised Power'] / $power_metrics['Average Power'];
+        $power_metrics['Variability Index'] = $power_metrics['Average Power'] ? $power_metrics['Normalised Power'] / $power_metrics['Average Power'] : 0.0;
         $power_metrics['Intensity Factor'] = $power_metrics['Normalised Power'] / $functional_threshold_power;
-        $power_metrics['Training Stress Score'] = (count($this->data_mesgs['record']['power']) * $power_metrics['Normalised Power'] * $power_metrics['Intensity Factor']) / ($functional_threshold_power * 36);
+        $power_metrics['Training Stress Score'] = ($samples * $power_metrics['Normalised Power'] * $power_metrics['Intensity Factor']) / ($functional_threshold_power * 36);
 
         // Round the values to make them something sensible.
         $power_metrics['Average Power'] = (int)round($power_metrics['Average Power']);
@@ -3321,9 +3387,25 @@ class phpFITFileAnalysis
         if (!isset($this->data_mesgs['record']['power'])) {
             throw new \Exception('phpFITFileAnalysis->criticalPower(): power data not present in FIT file!');
         }
+        $power = (array) $this->data_mesgs['record']['power'];
 
+        // The best average over $period samples; 0 when no window fits (every one spans a pause).
+        $best = function ($period) use ($power) {
+            $averages = ($this->php_trader_ext_loaded) ? trader_sma($power, $period) : $this->sma($power, $period);
+            if ($averages === false) {
+                return null;
+            }
+            // sma() is a generator; trader_sma() returns an array. PHP 8 rejects a Generator in
+            // max(), so normalise. Pre-existing, surfaced by PowerTest once the suite could run
+            // again (APP-1554).
+            $averages = is_array($averages) ? $averages : iterator_to_array($averages, false);
+
+            return $averages === [] ? 0 : max($averages);
+        };
+
+        $criticalPower_values = [];
         if (is_array($time_periods)) {
-            $count = count($this->data_mesgs['record']['power']);
+            $count = count($power);
             foreach ($time_periods as $time_period) {
                 if (!is_numeric($time_period)) {
                     throw new \Exception('phpFITFileAnalysis->criticalPower(): time periods must only contain numeric data!');
@@ -3335,23 +3417,20 @@ class phpFITFileAnalysis
                     break;
                 }
 
-                $averages = ($this->php_trader_ext_loaded) ? trader_sma($this->data_mesgs['record']['power'], $time_period) : $this->sma($this->data_mesgs['record']['power'], $time_period);
-                if ($averages !== false) {
-                    // sma() is a generator; trader_sma() returns an array. PHP 8 rejects a
-                    // Generator in max(), so normalise. Pre-existing, surfaced by PowerTest
-                    // once the suite could run again (APP-1554).
-                    $criticalPower_values[$time_period] = max(is_array($averages) ? $averages : iterator_to_array($averages));
+                $value = $best($time_period);
+                if ($value !== null) {
+                    $criticalPower_values[$time_period] = $value;
                 }
             }
 
             return $criticalPower_values;
         } elseif (is_numeric($time_periods) && $time_periods > 0) {
-            if ($time_periods > count($this->data_mesgs['record']['power'])) {
+            if ($time_periods > count($power)) {
                 $criticalPower_values[$time_periods] = 0;
             } else {
-                $averages = ($this->php_trader_ext_loaded) ? trader_sma($this->data_mesgs['record']['power'], $time_periods) : $this->sma($this->data_mesgs['record']['power'], $time_periods);
-                if ($averages !== false) {
-                    $criticalPower_values[$time_periods] = max(is_array($averages) ? $averages : iterator_to_array($averages));
+                $value = $best($time_periods);
+                if ($value !== null) {
+                    $criticalPower_values[$time_periods] = $value;
                 }
             }
 
@@ -3374,36 +3453,47 @@ class phpFITFileAnalysis
         /**
          * Event enumerated values of interest
          * 0 = timer
+         * event_type 0 = start; 1 = stop, 4 = stop_all, 8 = stop_disable, 9 = stop_disable_all.
+         * Only stop_all counted before; devices that write a plain stop never paused.
          */
-        $tek = array_keys($this->data_mesgs['event']['event'], 0);  // timer event keys
+        $tek = array_keys($this->data_mesgs['event']['event'], 0, true);  // timer event keys
 
-        $timer_start = [];
-        $timer_stop = [];
+        // Timer starts and stops as [timestamp, paused after it], in time order and, within a
+        // second, in file order. Walking the two lists separately on exact-second matches got stuck
+        // on a start and stop in the same second, or one before the first record: every later
+        // second then read as paused.
+        $transitions = [];
         foreach ($tek as $v) {
-            if ($this->data_mesgs['event']['event_type'][$v] === 0) {
-                $timer_start[$v] = $this->data_mesgs['event']['timestamp'][$v];
-            } elseif ($this->data_mesgs['event']['event_type'][$v] === 4) {
-                $timer_stop[$v] = $this->data_mesgs['event']['timestamp'][$v];
+            $event_type = $this->data_mesgs['event']['event_type'][$v] ?? null;
+            $timestamp = $this->data_mesgs['event']['timestamp'][$v] ?? null;
+            if ($timestamp === null) {
+                continue;
+            }
+            if ($event_type === 0) {
+                $transitions[] = [$timestamp, $v, false];
+            } elseif (in_array($event_type, [1, 4, 8, 9], true)) {
+                $transitions[] = [$timestamp, $v, true];
             }
         }
+        sort($transitions);
 
-        $first_ts = min($this->data_mesgs['record']['timestamp']);  // first timestamp
-        $last_ts = max($this->data_mesgs['record']['timestamp']);  // last timestamp
-
-        reset($timer_start);
-        $cur_start = next($timer_start);
-        $cur_stop = reset($timer_stop);
+        $record_timestamps = (array) ($this->data_mesgs['record']['timestamp'] ?? []);  // one record: a value
+        if ($record_timestamps === []) {
+            return [];
+        }
+        $first_ts = min($record_timestamps);  // first timestamp
+        $last_ts = max($record_timestamps);  // last timestamp
 
         $is_paused = [];
         $bPaused = false;
+        $next = 0;
+        $count = count($transitions);
 
         for ($i = $first_ts; $i < $last_ts; ++$i) {
-            if ($i == $cur_stop) {
-                $bPaused = true;
-                $cur_stop = next($timer_stop);
-            } elseif ($i == $cur_start) {
-                $bPaused = false;
-                $cur_start = next($timer_start);
+            // Every start or stop up to this second; the last of them decides.
+            while ($next < $count && $transitions[$next][0] <= $i) {
+                $bPaused = $transitions[$next][2];
+                ++$next;
             }
             $is_paused[$i] = $bPaused;
         }
@@ -3495,8 +3585,13 @@ class phpFITFileAnalysis
          * 42 = front_gear_change
          * 43 = rear_gear_change
          */
-        $fgcek = array_keys($this->data_mesgs['event']['event'], 42);  // front gear change event keys
-        $rgcek = array_keys($this->data_mesgs['event']['event'], 43);  // rear gear change event keys
+        $events = (array) ($this->data_mesgs['event']['event'] ?? []);
+        $fgcek = array_keys($events, 42, true);  // front gear change event keys
+        $rgcek = array_keys($events, 43, true);  // rear gear change event keys
+        $empty = ['front_gear_summary' => [], 'rear_gear_summary' => [], 'combined_summary' => [], 'gears_array' => []];
+        if (($fgcek === [] && $rgcek === []) || !isset($this->data_mesgs['record']['timestamp'])) {
+            return $empty;  // No gear changes (or no records): it used to warn its way to the same.
+        }
 
         /**
          * gear_change_data (uint32)
@@ -3553,7 +3648,7 @@ class phpFITFileAnalysis
         }
         ksort($rear_gears);
 
-        $timestamps = $this->data_mesgs['record']['timestamp'];
+        $timestamps = (array) $this->data_mesgs['record']['timestamp'];  // one record: a value
         $first_ts = min($timestamps);  // first timestamp
         $last_ts = max($timestamps);   // last timestamp
 
@@ -3564,7 +3659,7 @@ class phpFITFileAnalysis
             if ($first_ts == $fgc[0]['timestamp']) {
                 $fg = $fgc[0]['front_gear'];
             } else {
-                $fg = $fgc[0]['front_gear_num'] == 1 ? $front_gears[2] : $front_gears[1];
+                $fg = ($fgc[0]['front_gear_num'] == 1 ? $front_gears[2] ?? null : $front_gears[1] ?? null) ?? $fgc[0]['front_gear'];
             }
         }
 
@@ -3572,7 +3667,7 @@ class phpFITFileAnalysis
             if ($first_ts == $rgc[0]['timestamp']) {
                 $rg = $rgc[0]['rear_gear'];
             } else {
-                $rg = $rgc[0]['rear_gear_num'] == min($rear_gears) ? $rear_gears[$rgc[0]['rear_gear_num'] + 1] : $rear_gears[$rgc[0]['rear_gear_num'] - 1];
+                $rg = ($rgc[0]['rear_gear_num'] == min(array_keys($rear_gears)) ? $rear_gears[$rgc[0]['rear_gear_num'] + 1] ?? null : $rear_gears[$rgc[0]['rear_gear_num'] - 1] ?? null) ?? $rgc[0]['rear_gear'];
             }
         }
 
@@ -3585,28 +3680,24 @@ class phpFITFileAnalysis
             $is_paused = $this->isPaused();
         }
 
-        reset($fgc);
-        reset($rgc);
+        $f = 0;  // next front change
+        $r = 0;  // next rear change
         for ($i = $first_ts; $i < $last_ts; ++$i) {
-            if ($bIgnoreTimerPaused === true && $is_paused[$i] === true) {
+            // From the second after a change, ride in its gear. Every change before this second
+            // applies -- several in one second (a synchro shift) or during a pause, not one per
+            // second afterwards -- so this runs before a paused second is skipped.
+            while (isset($fgc[$f]) && $i > $fgc[$f]['timestamp']) {
+                $fg = $fgc[$f++]['front_gear'];
+            }
+            while (isset($rgc[$r]) && $i > $rgc[$r]['timestamp']) {
+                $rg = $rgc[$r++]['rear_gear'];
+            }
+
+            if ($bIgnoreTimerPaused === true && ($is_paused[$i] ?? false) === true) {
                 continue;
             }
 
-            $fgc_tmp = current($fgc);
-            $rgc_tmp = current($rgc);
-
-            if ($i > $fgc_tmp['timestamp']) {
-                if (next($fgc) !== false) {
-                    $fg = $fgc_tmp['front_gear'];
-                }
-            }
             $fg_summary[$fg] = isset($fg_summary[$fg]) ? $fg_summary[$fg] + 1 : 1;
-
-            if ($i > $rgc_tmp['timestamp']) {
-                if (next($rgc) !== false) {
-                    $rg = $rgc_tmp['rear_gear'];
-                }
-            }
             $rg_summary[$rg] = isset($rg_summary[$rg]) ? $rg_summary[$rg] + 1 : 1;
 
             $combined[$fg][$rg] = isset($combined[$fg][$rg]) ? $combined[$fg][$rg] + 1 : 1;
@@ -3638,17 +3729,12 @@ class phpFITFileAnalysis
         $all = in_array('all', $data_required);
         $timestamp         = ($all || in_array('timestamp', $data_required));
         $paused            = ($all || in_array('paused', $data_required));
-        $temperature       = ($all || in_array('temperature', $data_required));
         $lap               = ($all || in_array('lap', $data_required));
-        $position_lat      = ($all || in_array('position_lat', $data_required));
-        $position_long     = ($all || in_array('position_long', $data_required));
-        $distance          = ($all || in_array('distance', $data_required));
-        $altitude          = ($all || in_array('altitude', $data_required));
-        $speed             = ($all || in_array('speed', $data_required));
-        $heart_rate        = ($all || in_array('heart_rate', $data_required));
-        $cadence           = ($all || in_array('cadence', $data_required));
-        $power             = ($all || in_array('power', $data_required));
         $quadrant_analysis = ($all || in_array('quadrant-analysis', $data_required));
+        // The record fields getJSON() can include. (A variable named after each, looked up as $$key,
+        // used to decide; a record field with no such variable raised "Undefined variable".)
+        $record_fields = ['temperature', 'position_lat', 'position_long', 'distance', 'altitude', 'speed', 'heart_rate', 'cadence', 'power'];
+        $wanted = array_flip($all ? $record_fields : array_intersect($record_fields, $data_required));
 
         $for_json = [];
         $for_json['fix_data'] = isset($this->options['fix_data']) ? $this->options['fix_data'] : null;
@@ -3668,8 +3754,9 @@ class phpFITFileAnalysis
             $is_paused = $this->isPaused();
         }
 
-        foreach ($this->data_mesgs['record']['timestamp'] as $ts) {
-            if ($lap && is_array($this->data_mesgs['lap']['timestamp']) && $ts >= $this->data_mesgs['lap']['timestamp'][$lap_count - 1]) {
+        $lap_timestamps = $this->data_mesgs['lap']['timestamp'] ?? null;
+        foreach ((array) ($this->data_mesgs['record']['timestamp'] ?? []) as $ts) {
+            if ($lap && is_array($lap_timestamps) && isset($lap_timestamps[$lap_count - 1]) && $ts >= $lap_timestamps[$lap_count - 1]) {
                 $lap_count++;
             }
             $tmp = [];
@@ -3681,13 +3768,8 @@ class phpFITFileAnalysis
             }
 
             foreach ($this->data_mesgs['record'] as $key => $value) {
-                if ($key !== 'timestamp') {
-                    // Variable variable: only the keys named in $data_required have a matching
-                    // local. 'timestamp_original' does not, which raised "Undefined variable"
-                    // once per record under PHP 8. Pre-existing (APP-1554).
-                    if (isset($$key) && $$key) {
-                        $tmp[$key] = isset($value[$ts]) ? $value[$ts] : null;
-                    }
+                if (isset($wanted[$key])) {
+                    $tmp[$key] = $value[$ts] ?? null;
                 }
             }
 
@@ -3699,7 +3781,7 @@ class phpFITFileAnalysis
             }
 
             if ($paused) {
-                $tmp['paused'] = $is_paused[$ts];
+                $tmp['paused'] = $is_paused[$ts] ?? false;
             }
 
             $data[] = $tmp;
@@ -3708,7 +3790,7 @@ class phpFITFileAnalysis
 
         $for_json['data'] = $data;
 
-        return json_encode($for_json);
+        return json_encode($for_json, JSON_THROW_ON_ERROR);
     }
 
     /**
@@ -3720,89 +3802,100 @@ class phpFITFileAnalysis
         $for_json['fix_data'] = isset($this->options['fix_data']) ? $this->options['fix_data'] : null;
         $for_json['units'] = isset($this->options['units']) ? $this->options['units'] : null;
         $for_json['pace'] = isset($this->options['pace']) ? $this->options['pace'] : null;
-        $for_json['num_laps'] = count($this->data_mesgs['lap']['timestamp']);
+        // A one-lap file's fields are scalars (oneElementArrays()): count() of an int was a TypeError.
+        $for_json['num_laps'] = count((array) ($this->data_mesgs['lap']['timestamp'] ?? []));
         $data = [];
 
         for ($i=0; $i<$for_json['num_laps']; $i++) {
             $data[$i]['lap'] = $i;
             foreach ($this->data_mesgs['lap'] as $key => $value) {
-                $data[$i][$key] = $value[$i];
+                $data[$i][$key] = is_array($value) ? ($value[$i] ?? null) : $value;
             }
         }
 
         $for_json['data'] = $data;
 
-        return json_encode($for_json);
+        return json_encode($for_json, JSON_THROW_ON_ERROR);
     }
 
     /**
-     * Outputs tables of information being listened for and found within the processed FIT file.
+     * What was decoded and how, as data:
+     * - 'profile_version': the FIT SDK profile the library decodes with;
+     * - 'file_header': protocol and profile version, data size, of the (last) file read;
+     * - 'definitions': every definition message in the file, with message and field names
+     *   ('unknown' where the profile has none);
+     * - 'messages': per message decoded, each field's count of values (or its value when single).
+     */
+    public function debugInfo(): array
+    {
+        $definitions = [];
+        foreach ($this->defn_mesgs_all as $definition) {
+            $mesg_info = $this->data_mesg_info[$definition['global_mesg_num']] ?? null;
+            $fields = [];
+            foreach ($definition['field_defns'] as $defn) {
+                $fields[] = [
+                    'field_definition_number' => $defn['field_definition_number'],
+                    'size' => $defn['size'],
+                    'base_type' => $defn['base_type'],
+                    'field_name' => $mesg_info['field_defns'][$defn['field_definition_number']]['field_name'] ?? 'unknown',
+                ];
+            }
+            $definitions[] = [
+                'global_mesg_num' => $definition['global_mesg_num'],
+                'mesg_name' => $mesg_info['mesg_name'] ?? 'unknown',
+                'architecture' => $definition['architecture'] === 1 ? 'big-endian' : 'little-endian',
+                'fields' => $fields,
+                'num_dev_fields' => $definition['num_dev_fields'],
+                'total_size' => $definition['total_size'],
+            ];
+        }
+
+        $messages = [];
+        foreach ($this->data_mesgs as $mesg_key => $mesg) {
+            foreach ($mesg as $field_key => $field) {
+                $messages[$mesg_key][$field_key] = is_array($field) ? count($field) : $field;
+            }
+        }
+
+        return [
+            'profile_version' => Profile::VERSION,
+            'file_header' => $this->file_header,
+            'definitions' => $definitions,
+            'messages' => $messages,
+        ];
+    }
+
+    /**
+     * Outputs tables of debugInfo(): the definitions within the processed FIT file and the messages
+     * found. Values from the file are HTML-escaped (they used to be echoed as they came).
      */
     public function showDebugInfo()
     {
-        asort($this->defn_mesgs_all);  // Sort the definition messages
+        $e = fn($value) => htmlspecialchars(is_scalar($value) || $value === null ? (string) $value : json_encode($value), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $info = $this->debugInfo();
 
-        echo '<h3>Types</h3>';
-        echo '<table class=\'table table-condensed table-striped\'>';  // Bootstrap classes
-        echo '<thead>';
-        echo '<th>key</th>';
-        echo '<th>PHP unpack() format</th>';
-        echo '<th>Bytes</th>';
-        echo '</thead>';
-        echo '<tbody>';
-        foreach ($this->types as $key => $val) {
-            echo '<tr><td>'.$key.'</td><td>'.$val['format'].'</td><td>'.$val['bytes'].'</td></tr>';
-        }
-        echo '</tbody>';
-        echo '</table>';
-
-        echo '<br><hr><br>';
-
-        echo '<h3>Messages and Fields being listened for</h3>';
-        foreach ($this->data_mesg_info as $key => $val) {
-            echo '<h4>'.$val['mesg_name'].' ('.$key.')</h4>';
-            echo '<table class=\'table table-condensed table-striped\'>';
-            echo '<thead><th>ID</th><th>Name</th><th>Scale</th><th>Offset</th><th>Units</th></thead><tbody>';
-            foreach ($val['field_defns'] as $key2 => $val2) {
-                echo '<tr><td>'.$key2.'</td><td>'.$val2['field_name'].'</td><td>'.$val2['scale'].'</td><td>'.$val2['offset'].'</td><td>'.$val2['units'].'</td></tr>';
-            }
-            echo '</tbody></table><br><br>';
-        }
-
-        echo '<br><hr><br>';
+        echo '<h3>FIT SDK profile ' . $e($info['profile_version']) . '</h3>';
 
         echo '<h3>FIT Definition Messages contained within the file</h3>';
-        echo '<table class=\'table table-condensed table-striped\'>';
-        echo '<thead>';
-        echo '<th>global_mesg_num</th>';
-        echo '<th>num_fields</th>';
-        echo '<th>field defns</th>';
-        echo '<th>total_size</th>';
-        echo '</thead>';
-        echo '<tbody>';
-        foreach ($this->defn_mesgs_all as $key => $val) {
-            echo  '<tr><td>'.$val['global_mesg_num'].(isset($this->data_mesg_info[$val['global_mesg_num']]) ? ' ('.$this->data_mesg_info[$val['global_mesg_num']]['mesg_name'].')' : ' (unknown)').'</td><td>'.$val['num_fields'].'</td><td>';
-            foreach ($val['field_defns'] as $defn) {
-                echo 'defn: '.$defn['field_definition_number'].'; size: '.$defn['size'].'; type: '.$defn['base_type'];
-                echo ' (' . (isset($this->data_mesg_info[$val['global_mesg_num']]['field_defns'][$defn['field_definition_number']]) ? $this->data_mesg_info[$val['global_mesg_num']]['field_defns'][$defn['field_definition_number']]['field_name'] : 'unknown') . ')<br>';
+        echo '<table class=\'table table-condensed table-striped\'>';  // Bootstrap classes
+        echo '<thead><th>global_mesg_num</th><th>architecture</th><th>field defns</th><th>total_size</th></thead><tbody>';
+        foreach ($info['definitions'] as $definition) {
+            echo '<tr><td>' . $e($definition['global_mesg_num']) . ' (' . $e($definition['mesg_name']) . ')</td><td>' . $e($definition['architecture']) . '</td><td>';
+            foreach ($definition['fields'] as $field) {
+                echo 'defn: ' . $e($field['field_definition_number']) . '; size: ' . $e($field['size']) . '; type: ' . $e($field['base_type']) . ' (' . $e($field['field_name']) . ')<br>';
             }
-            echo  '</td><td>'.$val['total_size'].'</td></tr>';
+            echo '</td><td>' . $e($definition['total_size']) . '</td></tr>';
         }
-        echo '</tbody>';
-        echo '</table>';
+        echo '</tbody></table>';
 
         echo '<br><hr><br>';
 
         echo '<h3>Messages found in file</h3>';
-        foreach ($this->data_mesgs as $mesg_key => $mesg) {
+        foreach ($info['messages'] as $mesg_key => $fields) {
             echo '<table class=\'table table-condensed table-striped\'>';
-            echo '<thead><th>'.$mesg_key.'</th><th>count()</th></thead><tbody>';
-            foreach ($mesg as $field_key => $field) {
-                if (is_array($field)) {
-                    echo '<tr><td>'.$field_key.'</td><td>'.count($field).'</td></tr>';
-                } else {
-                    echo '<tr><td>'.$field_key.'</td><td>'.$field.'</td></tr>';
-                }
+            echo '<thead><th>' . $e($mesg_key) . '</th><th>count() or value</th></thead><tbody>';
+            foreach ($fields as $field_key => $field) {
+                echo '<tr><td>' . $e($field_key) . '</td><td>' . $e($field) . '</td></tr>';
             }
             echo '</tbody></table><br><br>';
         }
@@ -3811,88 +3904,62 @@ class phpFITFileAnalysis
     /*
      * Process HR messages
      *
-     * Based heavily on logic in commit:
-     * https://github.com/GoldenCheetah/GoldenCheetah/commit/957ae470999b9a57b5b8ec57e75512d4baede1ec
-     * Particularly the decodeHr() method
+     * Based on the logic in GoldenCheetah's decodeHr() (commit
+     * https://github.com/GoldenCheetah/GoldenCheetah/commit/957ae470999b9a57b5b8ec57e75512d4baede1ec),
+     * which the FIT SDK decoders' merge_heart_rates also follows. A strap buffers beats and sends
+     * them in hr messages: each carries its beats (filtered_bpm) and their times in 1/1024 s,
+     * either in full (event_timestamp) or as 12-bit values counting on from the previous time
+     * (event_timestamp_12). The first message whose timestamp and first time are both valid anchors
+     * the times to the clock (its timestamp is that first beat's). A message's beats pair with its
+     * own times, so a message with no valid beat, or times that cannot be read, affects only its
+     * own beats.
      */
-    private function processHrMessages()
+    private function processHrMessages(): void
     {
-        // Check that we have received HR messages
-        if (empty($this->data_mesgs['hr'])) {
+        if ($this->hr_messages === [] || empty($this->data_mesgs['record']['timestamp'])) {
             return;
         }
 
-        $hr = [];
-        $timestamps = [];
-
-        // Load all filtered_bpm values into the $hr array
-        foreach ($this->data_mesgs['hr']['filtered_bpm'] as $hr_val) {
-            if (is_array($hr_val)) {
-                foreach ($hr_val as $sub_hr_val) {
-                    $hr[] = $sub_hr_val;
+        $beats = [];     // [time in 1/1024 s, bpm]
+        $last = null;    // the latest time, which 12-bit times count on from
+        $anchor = null;  // clock time minus event time, in seconds
+        foreach ($this->hr_messages as $message) {
+            $bpm = $message['filtered_bpm'];
+            // Full times when any is valid, else the 12-bit ones (decoded even with no beats to
+            // pair, so the clock they count on moves on).
+            $full = $message['event_timestamp'];
+            $times = ($full !== null && array_filter($full, fn($t) => $t !== null) !== [])
+                ? $full
+                : self::hrTimes12($message['event_timestamp_12'], $last);
+            if ($anchor === null && $message['timestamp'] !== null && ($times[0] ?? null) !== null) {
+                $anchor = $message['timestamp'] - $times[0] / 1024.0;
+            }
+            foreach ($times as $i => $time) {
+                if ($time === null) {
+                    continue;
                 }
-            } else {
-                $hr[] = $hr_val;
+                $last = $time;
+                // filtered_bpm 255 is "no reading" (null here) and was averaged in as 255 bpm.
+                if (($bpm[$i] ?? null) !== null) {
+                    $beats[] = [$time, $bpm[$i]];
+                }
             }
         }
-
-        // Manually scale timestamps (i.e. divide by 1024)
-        $last_event_timestamp = $this->data_mesgs['hr']['event_timestamp'];
-        if (is_array($last_event_timestamp)) {
-            $last_event_timestamp = $last_event_timestamp[0];
+        $this->hr_messages = [];  // decoded: free the copy
+        if ($anchor === null) {
+            return;
         }
 
-        if (is_array($this->data_mesgs['hr']['timestamp'])) {
-            $start_timestamp = $this->data_mesgs['hr']['timestamp'][0] - $last_event_timestamp / 1024.0;
-        } else {
-            $start_timestamp = $this->data_mesgs['hr']['timestamp'] - $last_event_timestamp / 1024.0;
-        }
-
-        $timestamps[] = $last_event_timestamp / 1024.0;
-
-        // Determine timestamps (similar to compressed timestamps)
-        foreach ($this->data_mesgs['hr']['event_timestamp_12'] as $event_timestamp_12_val) {
-            $j=0;
-            for ($i=0; $i<11; $i++) {
-                $last_event_timestamp12 = $last_event_timestamp & 0xFFF;
-                $next_event_timestamp12 = null;
-
-                if ($j % 2 === 0) {
-                    $next_event_timestamp12 = $event_timestamp_12_val[$i] + (($event_timestamp_12_val[$i+1] & 0xF) << 8);
-                    $last_event_timestamp = ($last_event_timestamp & 0xFFFFF000) + $next_event_timestamp12;
-                } else {
-                    $next_event_timestamp12 = 16 * $event_timestamp_12_val[$i+1] + (($event_timestamp_12_val[$i] & 0xF0) >> 4);
-                    $last_event_timestamp = ($last_event_timestamp & 0xFFFFF000) + $next_event_timestamp12;
-                    $i++;
-                }
-                if ($next_event_timestamp12 < $last_event_timestamp12) {
-                    $last_event_timestamp += 0x1000;
-                }
-
-                $timestamps[] = $last_event_timestamp / 1024.0;
-                $j++;
-            }
-        }
-
-        // Map HR values to timestamps
-        $filtered_bpm_arr = [];
-        $secs = 0;
-        $record_timestamps = is_array($this->data_mesgs['record']['timestamp'])
-            ? $this->data_mesgs['record']['timestamp']
-            : [$this->data_mesgs['record']['timestamp']];
+        // Average the beats in each second of the records' range.
+        $record_timestamps = (array) $this->data_mesgs['record']['timestamp'];
         $min_record_ts = min($record_timestamps);
         $max_record_ts = max($record_timestamps);
-        foreach ($timestamps as $idx => $timestamp) {
-            $ts_secs = round($timestamp + $start_timestamp);
-
-            // Skip timestamps outside of the range we're interested in
+        $filtered_bpm_arr = [];
+        foreach ($beats as [$time, $value]) {
+            $ts_secs = (int) round($time / 1024.0 + $anchor);
             if ($ts_secs >= $min_record_ts && $ts_secs <= $max_record_ts) {
-                if (isset($filtered_bpm_arr[$ts_secs])) {
-                    $filtered_bpm_arr[$ts_secs][0] += $hr[$idx];
-                    $filtered_bpm_arr[$ts_secs][1]++;
-                } else {
-                    $filtered_bpm_arr[$ts_secs] = [$hr[$idx], 1];
-                }
+                $filtered_bpm_arr[$ts_secs][0] = ($filtered_bpm_arr[$ts_secs][0] ?? 0) + $value;
+                $filtered_bpm_arr[$ts_secs][1] = ($filtered_bpm_arr[$ts_secs][1] ?? 0) + 1;
             }
         }
 
@@ -3900,22 +3967,44 @@ class phpFITFileAnalysis
             // Heart rate can be delivered solely via `hr` messages (the separate
             // uncompressed-HR stream used by many chest-strap / ANT+ sensors). In that
             // case the `record` messages carry no heart_rate field yet, so initialise it
-            // before mapping the decoded values onto the record timestamps below.
-            if (!isset($this->data_mesgs['record']['heart_rate'])) {
-                $this->data_mesgs['record']['heart_rate'] = [];
-            } elseif (!is_array($this->data_mesgs['record']['heart_rate'])) {
-                // A single record message stores heart_rate as a scalar; normalise to an array.
-                $this->data_mesgs['record']['heart_rate'] = [$this->data_mesgs['record']['heart_rate']];
-            }
+            // before mapping the decoded values onto the record timestamps below. (This runs
+            // before oneElementArrays(), so an existing heart_rate is always keyed by timestamp.)
+            $this->data_mesgs['record']['heart_rate'] ??= [];
         }
 
         // Populate the heart_rate fields for record messages
         foreach ($filtered_bpm_arr as $idx => $arr) {
-            if (!is_array($arr) || count($arr) < 2) {
-                throw new \UnexpectedValueException("Expected [value, divisor] array at index {$idx}");
-            }
-
             $this->data_mesgs['record']['heart_rate'][$idx] = (int)round($arr[0] / $arr[1]);
         }
+    }
+
+    /**
+     * The times (1/1024 s) in event_timestamp_12: every 12-bit value the bytes hold, packed
+     * little-endian, each counting on from the time before it (from $last, which this advances)
+     * and rolling over every 4096. None when there is nothing to count on from, or the bytes are
+     * invalid: a guess would misplace this message's beats and, through $last, every later one's.
+     */
+    private static function hrTimes12(?array $bytes, ?int &$last): array
+    {
+        if ($bytes === null || $last === null || in_array(null, $bytes, true)) {
+            return [];
+        }
+
+        $times = [];
+        $previous = $last;
+        $count = intdiv(count($bytes) * 8, 12);
+        for ($k = 0; $k < $count; $k++) {
+            $bit = $k * 12;
+            $byte = $bit >> 3;
+            $value = (($bytes[$byte] | (($bytes[$byte + 1] ?? 0) << 8)) >> ($bit & 7)) & 0xFFF;
+            $time = ($previous & ~0xFFF) + $value;
+            if ($value < ($previous & 0xFFF)) {
+                $time += 0x1000;
+            }
+            $times[] = $previous = $time;
+        }
+        $last = $previous;
+
+        return $times;
     }
 }

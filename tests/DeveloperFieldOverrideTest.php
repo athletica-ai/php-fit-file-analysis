@@ -317,6 +317,26 @@ class DeveloperFieldOverrideTest extends \PHPUnit\Framework\TestCase
         $this->assertSame(200, $power[$this->ts(6)], 'the first valid declarer wins over a later valid one');
     }
 
+    /**
+     * A record carrying the Stryd field before its field_description is decoded when the
+     * description arrives, so it takes the Stryd value like the records after it.
+     */
+    public function testARecordCarryingTheFieldBeforeItsDescriptionIsOverriddenToo()
+    {
+        $bytes = $this->developerDataId()
+            . $this->definition(1, self::RECORD, [[253, 4, self::UINT32], [7, 2, self::UINT16]], [[0, 2, 0]])
+            . $this->data(1, pack('Vvv', 1000, 300, 200))
+            . $this->powerDescription(0, 0, self::UINT16);
+        for ($i = 1; $i < 40; $i++) {
+            $bytes .= $this->data(1, pack('Vvv', 1000 + $i, 300, 210));
+        }
+
+        $power = $this->parseBytes($bytes)->data_mesgs['record']['power'];
+
+        $this->assertSame(200, $power[$this->ts(0)]);
+        $this->assertSame(210, $power[$this->ts(1)]);
+    }
+
     /** Review finding: a description with scale 0 divided by zero; a float32 invalid value became NaN. */
     public function testAZeroScaleAndANanValueDoNotBreakTheParse()
     {
@@ -446,7 +466,8 @@ class DeveloperFieldOverrideTest extends \PHPUnit\Framework\TestCase
     /**
      * Third review: a session whose definition lacks avg/max power left the lists shorter than the
      * session count, and the overridden session's summary was silently skipped. A swim session with
-     * no power fields precedes the Stryd run.
+     * no power fields precedes the Stryd run. Session fields are now padded one entry per session,
+     * so the swim's is null.
      */
     public function testASessionWithoutPowerFieldsDoesNotStopTheNextBeingSummarised()
     {
@@ -454,7 +475,7 @@ class DeveloperFieldOverrideTest extends \PHPUnit\Framework\TestCase
         $bytes = $this->runThenRideHeader() . $swim . $this->summaryDefinition(4, self::SESSION)
             . $this->data(6, pack('VV', 990, 990)) . $this->runThenRide(false) . $this->summary(4, 1000, 1000, 300, 300, 300);
 
-        $this->assertSame(200, $this->parseBytes($bytes)->data_mesgs['session']['avg_power'], 'one value, so a scalar, and the run\'s not the watch\'s 300');
+        $this->assertSame([null, 200], $this->parseBytes($bytes)->data_mesgs['session']['avg_power'], 'the run\'s, not the watch\'s 300');
     }
 
     /**
