@@ -1938,10 +1938,12 @@ class phpFITFileAnalysis
         }
 
         // CX-87: a record's valid value for the native field it replaces; the first declarer with
-        // one wins.
+        // one wins, except that a later declarer's reading above 0 replaces an earlier 0 (an app
+        // that declares power and writes 0 must not hide Stryd's values on the same record).
         if ($mesg_name === 'record' && $record_timestamp !== null && (is_int($value) || is_float($value))) {
             $native = $this->nativeRecordFieldOverriddenBy($description);
-            if ($native !== null && !isset($this->dev_override_streams[$native][$record_timestamp])) {
+            $kept = $native !== null ? ($this->dev_override_streams[$native][$record_timestamp] ?? null) : null;
+            if ($native !== null && ($kept === null || ($kept == 0 && $value > 0))) {
                 $this->dev_override_streams[$native][$record_timestamp] = $value;
             }
         }
@@ -2153,8 +2155,9 @@ class phpFITFileAnalysis
      * CX-87: replace a native record field with the developer values that declare it, one session
      * at a time.
      *
-     * A session is overridden only when the developer field carries at least one valid value inside
-     * it. Within such a session every record carries the developer value or nothing -- never the
+     * A session is overridden only when the developer field carries at least one valid value above 0
+     * inside it: some apps declare the override and write 0 on every record, which would otherwise
+     * zero the session's power (seen on four athletes' files in production). Within such a session every record carries the developer value or nothing -- never the
      * watch's own value, because the two are not on one scale. That includes, deliberately, the rest
      * of a session after a pod drops out: a power-duration profile must come from one source, and
      * missing samples leave a best unchanged where foreign ones would lift it. Outside an overridden
@@ -2184,14 +2187,14 @@ class phpFITFileAnalysis
             $overridden = [];
             foreach ($sessions as $session_index => [$from, $to]) {
                 $in_window = $this->keysInWindow($timestamps, $from, $to);
-                $has_valid = false;
+                $has_reading = false;
                 foreach ($in_window as $ts) {
-                    if (isset($dev_stream[$ts])) {
-                        $has_valid = true;
+                    if (($dev_stream[$ts] ?? 0) > 0) {
+                        $has_reading = true;
                         break;
                     }
                 }
-                if (!$has_valid) {
+                if (!$has_reading) {
                     continue;
                 }
 
