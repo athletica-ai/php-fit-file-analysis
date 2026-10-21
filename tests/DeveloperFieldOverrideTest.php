@@ -232,6 +232,7 @@ class DeveloperFieldOverrideTest extends \PHPUnit\Framework\TestCase
         $power = $pFFA->data_mesgs['record']['power'];
 
         $this->assertSame(200, $power[$this->ts(0)], 'the run leg carries Stryd');
+        $this->assertSame(200, $power[$this->ts(39)], 'to its last record, though the session timestamp equals its start');
         $this->assertSame(250, $power[$this->ts(40)], 'the bike leg keeps its power meter');
         $this->assertCount(80, $power);
         $this->assertSame([200, 250], $pFFA->data_mesgs['session']['avg_power'], 'each session summarises its own stream');
