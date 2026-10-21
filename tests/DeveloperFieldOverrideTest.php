@@ -334,6 +334,115 @@ class DeveloperFieldOverrideTest extends \PHPUnit\Framework\TestCase
         $this->assertArrayNotHasKey($this->ts(1), $power, 'NaN is no value');
     }
 
+    /** Run records 0-39 (watch 300, Stryd 200) then, when $bike, ride records 40-79 (power meter 250). */
+    private function runThenRide($bike = true)
+    {
+        $bytes = '';
+        for ($i = 0; $i < 40; $i++) {
+            $bytes .= $this->data(1, pack('Vvv', 1000 + $i, 300, 200));
+        }
+        if ($bike) {
+            for ($i = 40; $i < 80; $i++) {
+                $bytes .= $this->data(2, pack('Vv', 1000 + $i, 250));
+            }
+        }
+
+        return $bytes;
+    }
+
+    private function runThenRideHeader()
+    {
+        return $this->developerDataId() . $this->powerDescription(0, 0, self::UINT16)
+            . $this->definition(1, self::RECORD, [[253, 4, self::UINT32], [7, 2, self::UINT16]], [[0, 2, 0]])
+            . $this->definition(2, self::RECORD, [[253, 4, self::UINT32], [7, 2, self::UINT16]]);
+    }
+
+    /** Second review: a Stryd value on a record the watch had no power for was appended out of time order. */
+    public function testTheOverriddenStreamStaysInTimeOrder()
+    {
+        $bytes = $this->runThenRideHeader();
+        for ($i = 0; $i < 40; $i++) {
+            $bytes .= $this->data(1, pack('Vvv', 1000 + $i, $i < 2 ? 0xFFFF : 300, 200));
+        }
+
+        $power = $this->parseBytes($bytes)->data_mesgs['record']['power'];
+
+        $this->assertSame(array_map([$this, 'ts'], range(0, 39)), array_keys($power));
+    }
+
+    /**
+     * Second review: one lap without a valid start_time stopped every lap being re-summarised, and a
+     * lap's window ran past its session into the next one. Run laps start at 1000 and 1020, a padded
+     * lap with no start follows, and the bike's lap starts at 1050 though the bike session starts at
+     * 1040, so the run's last lap would otherwise take ten bike samples.
+     */
+    public function testLapsAreSummarisedPastAMissingStartAndWithinTheirSession()
+    {
+        $bytes = $this->runThenRideHeader() . $this->summaryDefinition(3, self::LAP) . $this->summaryDefinition(4, self::SESSION)
+            . $this->runThenRide()
+            . $this->summary(3, 1000, 1000, 300, 300, 300) . $this->summary(3, 1020, 1020, 300, 300, 300)
+            . $this->summary(3, 0xFFFFFFFF, 1039, 300, 300, 300) . $this->summary(3, 1050, 1050, 250, 250, 250)
+            . $this->summary(4, 1000, 1000, 300, 300, 300) . $this->summary(4, 1040, 1040, 250, 250, 250);
+
+        $lap = $this->parseBytes($bytes)->data_mesgs['lap'];
+
+        $this->assertSame([200, 200, 300, 250], $lap['avg_power'], 'run laps re-derived, the padded lap left, the bike lap untouched');
+    }
+
+    /** Second review: a session without start_time made the brick one window and wiped the bike leg. */
+    public function testABrickWhoseSessionsCannotBeToldApartIsLeftAsItIs()
+    {
+        $bytes = $this->runThenRideHeader() . $this->summaryDefinition(4, self::SESSION)
+            . $this->runThenRide()
+            . $this->summary(4, 1000, 1000, 300, 300, 300) . $this->summary(4, 0xFFFFFFFF, 1040, 250, 250, 250);
+
+        $power = $this->parseBytes($bytes)->data_mesgs['record']['power'];
+
+        $this->assertSame(300, $power[$this->ts(0)]);
+        $this->assertSame(250, $power[$this->ts(40)]);
+    }
+
+    /** Second review: TSS, IF and total work kept describing the watch's stream. */
+    public function testPowerDerivedFiguresTheLibraryDoesNotRederiveAreCleared()
+    {
+        $session = $this->definition(3, self::SESSION, [[253, 4, self::UINT32], [20, 2, self::UINT16], [35, 2, self::UINT16], [36, 2, self::UINT16], [48, 4, self::UINT32]]);
+        $bytes = $this->runThenRideHeader() . $session . $this->runThenRide(false) . $this->data(3, pack('VvvvV', 1040, 300, 1500, 900, 600000));
+
+        $summary = $this->parseBytes($bytes)->data_mesgs['session'];
+
+        $this->assertSame(200, $summary['avg_power']);
+        $this->assertNull($summary['training_stress_score']);
+        $this->assertNull($summary['intensity_factor']);
+        $this->assertNull($summary['total_work']);
+    }
+
+    /**
+     * Second review: before CX-87 a declared developer field was copied into the record stream under
+     * its own name when the watch wrote no such field; Stryd's cadence arrives that way.
+     */
+    public function testANonPowerDeclarationTheWatchLacksIsStillCopiedAsBefore()
+    {
+        $cadence = $this->definition(0, self::FIELD_DESCRIPTION, [[0, 1, self::UINT8], [1, 1, self::UINT8], [2, 1, self::UINT8], [3, 8, self::STRING], [14, 2, self::UINT16], [15, 1, self::UINT8]])
+            . $this->data(0, pack('CCC', 0, 2, self::UINT8) . "cadence\0" . pack('vC', self::RECORD, 4));
+        $bytes = $this->developerDataId() . $cadence
+            . $this->definition(1, self::RECORD, [[253, 4, self::UINT32]], [[2, 1, 0]])
+            . $this->data(1, pack('VC', 1000, 85)) . $this->data(1, pack('VC', 1001, 86));
+
+        $this->assertSame([85, 86], $this->parseBytes($bytes)->data_mesgs['record']['cadence']);
+    }
+
+    /** powerMetrics() threw on a stream too short for one window before CX-87 shared the formula; it still does. */
+    public function testPowerMetricsStillRefusesAStreamTooShortForOneWindow()
+    {
+        $bytes = $this->runThenRideHeader();
+        for ($i = 0; $i < 10; $i++) {
+            $bytes .= $this->data(2, pack('Vv', 1000 + $i, 250));
+        }
+
+        $this->expectException(\DivisionByZeroError::class);
+        $this->parseBytes($bytes)->powerMetrics(250);
+    }
+
     /** Before CX-87 a developer field with no field description was skipped without advancing the read pointer. */
     public function testAnUndescribedDeveloperFieldIsSkippedWithoutMisreadingWhatFollows()
     {

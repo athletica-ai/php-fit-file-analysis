@@ -1943,8 +1943,10 @@ class phpFITFileAnalysis
         // list over the native field under the DEVELOPER field's name. That was wrong three ways: it
         // never ran (the option was forced off), it keyed the result by the developer name rather
         // than the native one, and a list with one value fewer than there are records lined up with
-        // nothing. Values are now collected per record above and applied per session here.
+        // nothing. Values are now collected per record above and applied per session here; the
+        // declarations the override does not handle keep their old copy.
         $this->applyDeveloperOverrides();
+        $this->copyUnhandledDeveloperDeclarations();
     }
 
     /**
@@ -1993,13 +1995,14 @@ class phpFITFileAnalysis
      *
      * A session is overridden only when the developer field carries at least one valid value inside
      * it. Within such a session every record carries the developer value or nothing -- never the
-     * watch's own value, not even on a record the developer field is missing from, because the two
-     * are not on one scale. Outside it the native stream is untouched: a brick whose bike leg has a
-     * real power meter and no Stryd keeps that leg's power, and a file where Stryd never wrote a
-     * valid value (field installed, no pod paired) stays a watch-only file, stream and summary alike.
-     *
-     * Applying after all records are read also means a description written a few records into the
-     * activity still covers the records before it, as long as those records carried the field.
+     * watch's own value, because the two are not on one scale. That includes records written before
+     * the description (they carry no developer value) and, deliberately, the rest of a session after
+     * a pod drops out: a power-duration profile must come from one source, and missing samples
+     * leave a best unchanged where foreign ones would lift it. Outside an overridden session the
+     * native stream is untouched: a brick whose bike leg has a real power meter and no Stryd keeps
+     * that leg's power, and a file where Stryd never wrote a valid value (field installed, no pod
+     * paired) stays a watch-only file, stream and summary alike. A multi-session file whose sessions
+     * cannot be told apart is left as it is rather than overridden blind.
      *
      * The session's and its laps' avg_/max_ (and normalized_power for power) are then re-derived
      * from the stream that survives, rounded to whole units as the device writes them.
@@ -2010,22 +2013,20 @@ class phpFITFileAnalysis
             return;
         }
 
-        // Without usable session windows the whole file is one window, which is session 0 when the
-        // file holds exactly one session message and no session's summary otherwise.
-        $sessions = $this->messageWindows('session');
-        if ($sessions === []) {
-            $single = count($this->data_mesgs['session']['timestamp'] ?? []) === 1;
-            $sessions = [($single ? 0 : -1) => [PHP_INT_MIN, PHP_INT_MAX]];
+        $sessions = $this->sessionWindows();
+        if ($sessions === null) {
+            return;
         }
         $laps = $this->messageWindows('lap');
+        $timestamps = (array) $this->data_mesgs['record']['timestamp'];
+        sort($timestamps);
 
         foreach ($this->dev_override_streams as $field => $dev_stream) {
+            $overridden = [];
             foreach ($sessions as $session_index => [$from, $to]) {
-                $timestamps = array_filter($this->data_mesgs['record']['timestamp'], function ($ts) use ($from, $to) {
-                    return $ts >= $from && $ts <= $to;
-                });
+                $in_window = $this->keysInWindow($timestamps, $from, $to);
                 $has_valid = false;
-                foreach ($timestamps as $ts) {
+                foreach ($in_window as $ts) {
                     if (isset($dev_stream[$ts])) {
                         $has_valid = true;
                         break;
@@ -2035,20 +2036,31 @@ class phpFITFileAnalysis
                     continue;
                 }
 
-                foreach ($timestamps as $ts) {
+                foreach ($in_window as $ts) {
                     if (isset($dev_stream[$ts])) {
                         $this->data_mesgs['record'][$field][$ts] = $dev_stream[$ts];
                     } else {
                         unset($this->data_mesgs['record'][$field][$ts]);
                     }
                 }
+                $overridden[$session_index] = [$from, $to];
+            }
+            if ($overridden === []) {
+                continue;
+            }
 
+            // A timestamp the native stream had no value for was appended at the end; restore time order.
+            ksort($this->data_mesgs['record'][$field]);
+            $keys = array_keys($this->data_mesgs['record'][$field]);
+
+            foreach ($overridden as $session_index => [$from, $to]) {
                 if ($session_index >= 0) {
-                    $this->summariseWindow('session', $session_index, $field, $from, $to);
+                    $this->summariseWindow('session', $session_index, $field, $this->keysInWindow($keys, $from, $to));
                 }
                 foreach ($laps as $lap_index => [$lap_from, $lap_to, $lap_start]) {
                     if ($lap_start >= $from && $lap_start <= $to) {
-                        $this->summariseWindow('lap', $lap_index, $field, $lap_from, $lap_to);
+                        // Clamped to the session, so a lap never takes samples from the next one.
+                        $this->summariseWindow('lap', $lap_index, $field, $this->keysInWindow($keys, max($lap_from, $from), min($lap_to, $to)));
                     }
                 }
             }
@@ -2056,19 +2068,40 @@ class phpFITFileAnalysis
     }
 
     /**
-     * CX-87: [from, to] in record timestamps for each session or lap message, by message index. A
-     * message runs from its start_time until the next one starts; the first is open at the front and
-     * the last at the back, so no record falls between windows. The message's own timestamp is not
-     * used as its end: the Stryd reproducer writes it equal to start_time on every session and lap.
-     * start_time is still raw (FIT epoch) at this point -- fixData() shifts it later -- while record
-     * timestamps are already Unix, so the shift is applied here. Empty when any start is missing.
+     * CX-87: [from, to] for each session, by session index. One session (or none) is the whole file.
+     * Several are windowed by start_time; session fields are not padded per message, so when any
+     * session lacks a start_time the indexes cannot be trusted and null is returned.
+     */
+    private function sessionWindows()
+    {
+        $count = count((array) ($this->data_mesgs['session']['timestamp'] ?? []));
+        if ($count <= 1) {
+            return [($count === 1 ? 0 : -1) => [PHP_INT_MIN, PHP_INT_MAX]];
+        }
+
+        $starts = $this->data_mesgs['session']['start_time'] ?? null;
+        if (!is_array($starts) || count($starts) !== $count || in_array(null, $starts, true)) {
+            return null;
+        }
+
+        return $this->messageWindows('session');
+    }
+
+    /**
+     * CX-87: [from, to, start] in record timestamps for each session or lap message, by message
+     * index. A message runs from its start_time until the next one starts; the first is open at the
+     * front and the last at the back, so no record falls between windows. The message's own
+     * timestamp is not used as its end: the Stryd reproducer writes it equal to start_time on every
+     * session and lap. start_time is still raw (FIT epoch) at this point -- fixData() shifts it
+     * later -- while record timestamps are already Unix, so the shift is applied here. A message
+     * with no start_time (a padded lap) gets no window and is not re-summarised.
      */
     private function messageWindows($mesg_name)
     {
-        $starts = $this->data_mesgs[$mesg_name]['start_time'] ?? [];
-        if (!is_array($starts) || $starts === [] || in_array(null, $starts, true)) {
-            return [];
-        }
+        $starts = array_filter((array) ($this->data_mesgs[$mesg_name]['start_time'] ?? []), function ($start) {
+            return $start !== null;
+        });
+        ksort($starts);
 
         $shift = $this->garmin_timestamps ? 0 : FIT_UNIX_TS_DIFF;
         $indexes = array_keys($starts);
@@ -2085,23 +2118,44 @@ class phpFITFileAnalysis
         return $windows;
     }
 
-    /**
-     * CX-87: overwrite one session's or lap's avg_/max_ (and normalized_power for power) for a field
-     * from the record stream inside [from, to]. Only a value the message already carries is replaced,
-     * and only when that field's list has one entry per message, so an index always means the same
-     * message. With no surviving value the device's figure would describe the discarded stream, so
-     * it is removed (null) rather than kept.
-     */
-    private function summariseWindow($mesg_name, $index, $field, $from, $to)
+    /** CX-87: the values of a sorted list that fall in [from, to], found by binary search. */
+    private function keysInWindow(array $sorted, $from, $to)
     {
-        $values = [];
-        foreach ($this->data_mesgs['record'][$field] ?? [] as $ts => $value) {
-            if ($ts >= $from && $ts <= $to) {
-                $values[$ts] = $value;
+        $lo = 0;
+        $hi = count($sorted);
+        while ($lo < $hi) {
+            $mid = ($lo + $hi) >> 1;
+            if ($sorted[$mid] < $from) {
+                $lo = $mid + 1;
+            } else {
+                $hi = $mid;
             }
         }
-        ksort($values);
-        $values = array_values($values);
+
+        $keys = [];
+        for ($i = $lo, $n = count($sorted); $i < $n && $sorted[$i] <= $to; ++$i) {
+            $keys[] = $sorted[$i];
+        }
+
+        return $keys;
+    }
+
+    /**
+     * CX-87: overwrite one session's or lap's avg_/max_ (and normalized_power for power) for a field
+     * from the record values at $timestamps. Power-derived figures this library does not re-derive
+     * (training stress score, intensity factor, total work) are cleared, since they describe the
+     * discarded stream. Only a value the message already carries is replaced, and only when that
+     * field's list has one entry per message, so an index always means the same message. With no
+     * surviving value the device's figure would describe the discarded stream, so it becomes null.
+     */
+    private function summariseWindow($mesg_name, $index, $field, array $timestamps)
+    {
+        $values = [];
+        foreach ($timestamps as $ts) {
+            if (isset($this->data_mesgs['record'][$field][$ts])) {
+                $values[] = $this->data_mesgs['record'][$field][$ts];
+            }
+        }
 
         $summary = [
             'avg_' . $field => count($values) ? (int) round(array_sum($values) / count($values)) : null,
@@ -2112,14 +2166,39 @@ class phpFITFileAnalysis
             // formula alone would give 0.
             $np = $this->normalisedPower($values);
             $summary['normalized_power'] = $np === null ? $summary['avg_power'] : (int) round($np);
+            $summary['training_stress_score'] = null;
+            $summary['intensity_factor'] = null;
+            $summary['total_work'] = null;
         }
 
-        $message_count = count($this->data_mesgs[$mesg_name]['timestamp'] ?? []);
+        $message_count = count((array) ($this->data_mesgs[$mesg_name]['timestamp'] ?? []));
         foreach ($summary as $key => $value) {
             if (isset($this->data_mesgs[$mesg_name][$key]) && is_array($this->data_mesgs[$mesg_name][$key])
                 && count($this->data_mesgs[$mesg_name][$key]) === $message_count
                 && array_key_exists($index, $this->data_mesgs[$mesg_name][$key])) {
                 $this->data_mesgs[$mesg_name][$key][$index] = $value;
+            }
+        }
+    }
+
+    /**
+     * Before CX-87, a developer field declaring a native field was copied into the record stream
+     * under its own name whenever the record carried no field of that name (the option guarding a
+     * replacement was forced off). Stryd's cadence on a watch without native cadence arrives that
+     * way, and FitFileParser::getMetricArray() reads such sequential lists. Kept as it was for every
+     * declaration the CX-87 override does not handle: non-power fields, and power with the option off.
+     */
+    private function copyUnhandledDeveloperDeclarations()
+    {
+        foreach ($this->dev_field_descriptions as $developer_data_index) {
+            foreach ($developer_data_index as $description) {
+                if (!isset($description['native_field_num']) || ($description['overrides_native'] ?? null) !== null) {
+                    continue;
+                }
+                if (isset($this->data_mesgs['record'][$description['field_name']])) {
+                    continue;
+                }
+                $this->data_mesgs['record'][$description['field_name']] = $this->data_mesgs['developer_data'][$description['field_name']]['data'] ?? [];
             }
         }
     }
@@ -3126,7 +3205,12 @@ class phpFITFileAnalysis
         $power_metrics['Average Power'] = array_sum($non_null_power_records) / count($non_null_power_records);
         $power_metrics['Kilojoules'] = ($power_metrics['Average Power'] * count($this->data_mesgs['record']['power'])) / 1000;
 
-        $power_metrics['Normalised Power'] = $this->normalisedPower($this->data_mesgs['record']['power']) ?? 0.0;
+        $normalised_power = $this->normalisedPower($this->data_mesgs['record']['power']);
+        if ($normalised_power === null) {
+            // As before CX-87 shared the formula: a stream too short for one window has no NP.
+            throw new \DivisionByZeroError('Division by zero');
+        }
+        $power_metrics['Normalised Power'] = $normalised_power;
 
         $power_metrics['Variability Index'] = $power_metrics['Normalised Power'] / $power_metrics['Average Power'];
         $power_metrics['Intensity Factor'] = $power_metrics['Normalised Power'] / $functional_threshold_power;
