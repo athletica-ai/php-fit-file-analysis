@@ -139,6 +139,32 @@ class DeveloperFieldOverrideTest extends \PHPUnit\Framework\TestCase
         $this->assertCount(self::RECORDS - 1, $pFFA->data_mesgs['developer_data']['power']['data'], 'the developer data is still read');
     }
 
+    /**
+     * Only power is overridden. Stryd also declares vertical oscillation (native 20/39), but in
+     * centimetres with no scale against the watch's millimetres, and not the same measurement either,
+     * so the watch's value stays and Stryd's stays in developer_data.
+     */
+    public function testADeclaredOverrideOfAFieldOtherThanPowerKeepsTheNativeValue()
+    {
+        $developerDataId = $this->definition(5, self::DEVELOPER_DATA_ID, [[3, 1, self::UINT8]]);
+        $description = $this->definition(0, self::FIELD_DESCRIPTION, [
+            [0, 1, self::UINT8], [1, 1, self::UINT8], [2, 1, self::UINT8], [3, 21, self::STRING], [8, 12, self::STRING], [14, 2, self::UINT16], [15, 1, self::UINT8],
+        ]);
+        $record = $this->definition(1, self::RECORD, [[253, 4, self::UINT32], [39, 2, self::UINT16]], [[0, 1, 0]]);
+        $file = $this->fitFile(
+            $developerDataId . $this->data(5, pack('C', 0))
+            . $description . $this->data(0, pack('CCC', 0, 0, self::UINT8) . "vertical oscillation\0" . "centimeters\0" . pack('vC', self::RECORD, 39))
+            . $record
+            . $this->data(1, pack('VvC', 1000, 630, 34))
+            . $this->data(1, pack('VvC', 1001, 640, 35))
+        );
+
+        $pFFA = new adriangibbons\phpFITFileAnalysis($file, ['input_is_data' => true, 'units' => 'raw']);
+
+        $this->assertEquals([$this->ts(0) => 63, $this->ts(1) => 64], $pFFA->data_mesgs['record']['vertical_oscillation']);
+        $this->assertSame([34, 35], $pFFA->data_mesgs['developer_data']['vertical oscillation']['data']);
+    }
+
     /** Before CX-87 a developer field with no field description was skipped without advancing the read pointer. */
     public function testAnUndescribedDeveloperFieldIsSkippedWithoutMisreadingWhatFollows()
     {

@@ -37,6 +37,8 @@ if (!defined('FIT_UNIX_TS_DIFF')) {
 
 class phpFITFileAnalysis
 {
+    private const OVERRIDABLE_RECORD_FIELDS = [7];  // CX-87: record field numbers a developer field may replace (power).
+
     public $data_mesgs = [];  // Used to store the data read from the file in associative arrays.
     private $dev_field_descriptions = [];
     private $overridden_record_fields = [];  // CX-87: native record fields a developer field declares it replaces, by native name.
@@ -1960,14 +1962,18 @@ class phpFITFileAnalysis
     /**
      * CX-87: the native record field a developer field replaces, or null when it declares none.
      * A declaration names a message number and a field number; only record (20) overrides are
-     * honoured here, and only for a field this library knows the name of.
+     * honoured here, and only for power (field 7). Stryd also declares cadence, ground time and
+     * vertical oscillation, but its ground time and vertical oscillation are not the watch's
+     * quantity in the watch's units (603 ms against 320 ms, 3.4 cm with no scale against 63 mm on
+     * the reproducer), so promoting them would put a foreign value under the native name. They
+     * stay in developer_data.
      */
     private function nativeRecordFieldOverriddenBy(array $description)
     {
         if (!$this->options['overwrite_with_dev_data']) {
             return null;
         }
-        if (($description['native_mesg_num'] ?? null) !== 20 || !isset($description['native_field_num'])) {
+        if (($description['native_mesg_num'] ?? null) !== 20 || !in_array($description['native_field_num'] ?? null, self::OVERRIDABLE_RECORD_FIELDS, true)) {
             return null;
         }
 
