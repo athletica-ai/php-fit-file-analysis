@@ -98,6 +98,8 @@ echo "];";
 **Enumerated Data**
 The FIT protocol makes use of enumerated data types. Where these values have been identified in the FIT SDK, they have been included in the class as a private variable: $enum_data.
 
+This library has no official FIT profile version of its own, so Garmin's [FIT SDK](https://developer.garmin.com/fit/) is the reference to check when adding or updating enumerated values. Garmin product IDs come from `garminProduct` in the SDK's [profile.js](https://github.com/garmin/fit-javascript-sdk/blob/main/src/profile.js), currently checked against v21.218.0.
+
 A public function is available, which will return the enumerated value for a given message type. For example:
 ```php
 // Access data stored within the private class variable $enum_data
@@ -372,7 +374,7 @@ array gearChanges($bIgnoreTimerPaused = true)
 ```
 
 ## Acknowledgement
-This class has been created using information available in a Software Development Kit (SDK) made available by ANT ([thisisant.com](http://www.thisisant.com/resources/fit)).
+This class has been created using information available in a Software Development Kit (SDK) originally made available by ANT and now maintained by Garmin ([developer.garmin.com/fit](https://developer.garmin.com/fit/)).
 
 As a minimum, I'd recommend reading the three PDFs included in the SDK:
 
