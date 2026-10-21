@@ -41,7 +41,7 @@ class phpFITFileAnalysis
 
     public $data_mesgs = [];  // Used to store the data read from the file in associative arrays.
     private $dev_field_descriptions = [];
-    private $overridden_record_fields = [];  // CX-87: native record fields a developer field declares it replaces, by native name.
+    private $dev_override_streams = [];      // CX-87: per native record field a developer field replaces, its developer value by record timestamp (null = invalid).
     private $options = null;                 // Options provided to __construct().
     private $file_contents = '';             // FIT file is read-in to memory as a string, split into an array, and reversed. See __construct().
     private $file_pointer = 0;               // Points to the location in the file that shall be read next.
@@ -1843,14 +1843,9 @@ class phpFITFileAnalysis
                             if (isset($tmp_record_array['units'])) {
                                 $tmp_record_array['units'] = strtolower(implode('', explode("\0", $tmp_record_array['units'])));
                             }
+                            // CX-87: resolve once which native record field (if any) this developer field replaces.
+                            $tmp_record_array['overrides_native'] = $this->nativeRecordFieldOverriddenBy($tmp_record_array);
                             $this->dev_field_descriptions[$developer_data_index][$field_definition_number] = $tmp_record_array;
-                            // CX-87: remember which native record fields this file replaces. Field
-                            // descriptions precede the records that use them, so from here on the
-                            // native value of an overridden field is never stored (see the flush below).
-                            $overridden = $this->nativeRecordFieldOverriddenBy($tmp_record_array);
-                            if ($overridden !== null) {
-                                $this->overridden_record_fields[$overridden] = true;
-                            }
                             unset($tmp_record_array);
                         }
                         foreach ($this->defn_mesgs[$local_mesg_type]['dev_field_definitions'] as $field_defn) {
@@ -1874,11 +1869,12 @@ class phpFITFileAnalysis
                             $dev_value = unpack($this->types[$description['fit_base_type_id']]['format'], substr($this->file_contents, $this->file_pointer, $field_defn['size']))['tmp'];
                             $this->data_mesgs['developer_data'][$description['field_name']]['data'][] = $dev_value;
 
-                            // CX-87: a declared override lands on THIS record under the native name, keyed
-                            // by the record's timestamp like any native field, instead of as a bare list
-                            // that no longer lines up with the records once one of them lacks the value.
-                            $overridden = $this->nativeRecordFieldOverriddenBy($description);
-                            if ($overridden !== null && $this->defn_mesgs[$local_mesg_type]['global_mesg_num'] === 20) {
+                            // CX-87: collect a declared override for THIS record, keyed by its timestamp at the
+                            // flush below; applyDeveloperOverrides() decides where it replaces the native value.
+                            // Two developer fields declaring the same native field: the first valid value wins,
+                            // so a later invalid one never erases an earlier good one.
+                            $overridden = $description['overrides_native'] ?? null;
+                            if ($overridden !== null && $this->defn_mesgs[$local_mesg_type]['global_mesg_num'] === 20 && !isset($tmp_dev_overrides[$overridden])) {
                                 $tmp_dev_overrides[$overridden] = $this->developerValueOrNull($description, $dev_value);
                             }
 
@@ -1924,14 +1920,8 @@ class phpFITFileAnalysis
                                 $max_record_timestamp = $timestamp;
                             }
 
-                            // CX-87: an overridden native field carries the developer value for this
-                            // record, or nothing at all -- never the watch's own value, not even on a
-                            // record the developer field happens to be missing from. The two are not on
-                            // one scale, so a single native sample would still be a foreign reading.
-                            if ($this->defn_mesgs[$local_mesg_type]['global_mesg_num'] === 20) {
-                                foreach ($this->overridden_record_fields as $native_name => $_) {
-                                    $tmp_record_array[$native_name] = $tmp_dev_overrides[$native_name] ?? null;
-                                }
+                            foreach ($tmp_dev_overrides as $native_name => $dev_override) {
+                                $this->dev_override_streams[$native_name][$timestamp] = $dev_override;
                             }
 
                             foreach ($tmp_record_array as $key => $value) {
@@ -1949,14 +1939,12 @@ class phpFITFileAnalysis
                     }
             }
         }
-        // CX-87: the override used to be applied here, after the fact, by copying the developer
-        // field's bare value list over the native field under the DEVELOPER field's name. That was
-        // wrong three ways: it never ran (the option was forced off), it keyed the result by the
-        // developer name rather than the native one, and a list with one value fewer than there are
-        // records lined up with nothing. The override now happens per record above. What remains
-        // here is the session summary: a session's avg/max power describe the watch's stream, which
-        // the file has just told us to discard, so they are re-derived from the stream that survives.
-        $this->summariseOverriddenRecordFields();
+        // CX-87: the override used to be applied here by copying the developer field's bare value
+        // list over the native field under the DEVELOPER field's name. That was wrong three ways: it
+        // never ran (the option was forced off), it keyed the result by the developer name rather
+        // than the native one, and a list with one value fewer than there are records lined up with
+        // nothing. Values are now collected per record above and applied per session here.
+        $this->applyDeveloperOverrides();
     }
 
     /**
@@ -1980,67 +1968,165 @@ class phpFITFileAnalysis
         return $this->data_mesg_info[20]['field_defns'][$description['native_field_num']]['field_name'] ?? null;
     }
 
-    /** CX-87: a developer value with its own scale/offset applied, or null for the type's invalid value. */
+    /**
+     * CX-87: a developer value with its own scale/offset applied, or null when it is the type's
+     * invalid value or not a number (a float field's invalid value unpacks to NaN). A scale of 0 is
+     * not a usable scale and is read as 1 rather than dividing by it.
+     */
     private function developerValueOrNull(array $description, $raw)
     {
         $base_type = $description['fit_base_type_id'] ?? null;
         if ($base_type !== null && isset($this->invalid_values[$base_type]) && $raw === $this->invalid_values[$base_type]) {
             return null;
         }
+        if (is_float($raw) && !is_finite($raw)) {
+            return null;
+        }
+        $scale = $description['scale'] ?? 1;
 
-        return $raw / ($description['scale'] ?? 1) - ($description['offset'] ?? 0);
+        return $raw / ($scale ?: 1) - ($description['offset'] ?? 0);
     }
 
     /**
-     * CX-87: once a developer field has replaced a native record field, the session message's
-     * avg_/max_ scalars for that field (and normalized_power for power) still describe the stream
-     * that was discarded. Re-derive them from the stream that survives, rounded to whole units as
-     * the device writes them, so a consumer reading the summary and the stream sees one source.
-     * Multi-session files keep the device's scalars: slicing the stream per session is not worth
-     * doing blind, and no such file has been seen with a developer override.
+     * CX-87: replace a native record field with the developer values that declare it, one session
+     * at a time.
+     *
+     * A session is overridden only when the developer field carries at least one valid value inside
+     * it. Within such a session every record carries the developer value or nothing -- never the
+     * watch's own value, not even on a record the developer field is missing from, because the two
+     * are not on one scale. Outside it the native stream is untouched: a brick whose bike leg has a
+     * real power meter and no Stryd keeps that leg's power, and a file where Stryd never wrote a
+     * valid value (field installed, no pod paired) stays a watch-only file, stream and summary alike.
+     *
+     * Applying after all records are read also means a description written a few records into the
+     * activity still covers the records before it, as long as those records carried the field.
+     *
+     * The session's and its laps' avg_/max_ (and normalized_power for power) are then re-derived
+     * from the stream that survives, rounded to whole units as the device writes them.
      */
-    private function summariseOverriddenRecordFields()
+    private function applyDeveloperOverrides()
     {
-        foreach (array_keys($this->overridden_record_fields) as $field) {
-            $values = array_values(array_filter($this->data_mesgs['record'][$field] ?? [], function ($v) {
-                return $v !== null;
-            }));
-            if (count($values) === 0) {
-                continue;
-            }
-
-            $summary = ['avg_' . $field => array_sum($values) / count($values), 'max_' . $field => max($values)];
-            if ($field === 'power') {
-                $summary['normalized_power'] = $this->normalisedPower($this->data_mesgs['record']['power']);
-            }
-            foreach ($summary as $key => $value) {
-                $this->setSingleSessionValue($key, (int) round($value));
-            }
-        }
-    }
-
-    /** CX-87: write a session scalar only when the file holds exactly one session's worth of it. */
-    private function setSingleSessionValue($key, $value)
-    {
-        if (!isset($this->data_mesgs['session'][$key])) {
+        if (empty($this->dev_override_streams) || empty($this->data_mesgs['record']['timestamp'])) {
             return;
         }
-        if (is_array($this->data_mesgs['session'][$key])) {
-            if (count($this->data_mesgs['session'][$key]) === 1) {
-                $this->data_mesgs['session'][$key] = [$value];
-            }
-            return;
+
+        // Without usable session windows the whole file is one window, which is session 0 when the
+        // file holds exactly one session message and no session's summary otherwise.
+        $sessions = $this->messageWindows('session');
+        if ($sessions === []) {
+            $single = count($this->data_mesgs['session']['timestamp'] ?? []) === 1;
+            $sessions = [($single ? 0 : -1) => [PHP_INT_MIN, PHP_INT_MAX]];
         }
-        $this->data_mesgs['session'][$key] = $value;
+        $laps = $this->messageWindows('lap');
+
+        foreach ($this->dev_override_streams as $field => $dev_stream) {
+            foreach ($sessions as $session_index => [$from, $to]) {
+                $timestamps = array_filter($this->data_mesgs['record']['timestamp'], function ($ts) use ($from, $to) {
+                    return $ts >= $from && $ts <= $to;
+                });
+                $has_valid = false;
+                foreach ($timestamps as $ts) {
+                    if (isset($dev_stream[$ts])) {
+                        $has_valid = true;
+                        break;
+                    }
+                }
+                if (!$has_valid) {
+                    continue;
+                }
+
+                foreach ($timestamps as $ts) {
+                    if (isset($dev_stream[$ts])) {
+                        $this->data_mesgs['record'][$field][$ts] = $dev_stream[$ts];
+                    } else {
+                        unset($this->data_mesgs['record'][$field][$ts]);
+                    }
+                }
+
+                if ($session_index >= 0) {
+                    $this->summariseWindow('session', $session_index, $field, $from, $to);
+                }
+                foreach ($laps as $lap_index => [$lap_from, $lap_to]) {
+                    if ($lap_from >= $from && $lap_to <= $to) {
+                        $this->summariseWindow('lap', $lap_index, $field, $lap_from, $lap_to);
+                    }
+                }
+            }
+        }
     }
 
     /**
-     * Normalised Power over a record power stream: 30-sample rolling mean, fourth power, mean,
-     * fourth root. Shared by powerMetrics() and the CX-87 session summary.
+     * CX-87: [start, end] in record timestamps for each session or lap message, by message index.
+     * start_time is stored raw (FIT epoch) while timestamp has the Unix shift applied, so the shift
+     * is applied to start_time here. Messages whose start or end is missing are left out.
+     */
+    private function messageWindows($mesg_name)
+    {
+        $starts = $this->data_mesgs[$mesg_name]['start_time'] ?? [];
+        $ends = $this->data_mesgs[$mesg_name]['timestamp'] ?? [];
+        if (!is_array($starts) || !is_array($ends) || count($starts) !== count($ends)) {
+            return [];
+        }
+
+        $shift = $this->garmin_timestamps ? 0 : FIT_UNIX_TS_DIFF;
+        $windows = [];
+        foreach ($starts as $i => $start) {
+            if ($start !== null && isset($ends[$i])) {
+                $windows[$i] = [$start + $shift, $ends[$i]];
+            }
+        }
+
+        return $windows;
+    }
+
+    /**
+     * CX-87: overwrite one session's or lap's avg_/max_ (and normalized_power for power) for a field
+     * from the record stream inside [from, to]. Only a value the message already carries is replaced,
+     * and only when that field's list has one entry per message, so an index always means the same
+     * message. With no surviving value the device's figure would describe the discarded stream, so
+     * it is removed (null) rather than kept.
+     */
+    private function summariseWindow($mesg_name, $index, $field, $from, $to)
+    {
+        $values = [];
+        foreach ($this->data_mesgs['record'][$field] ?? [] as $ts => $value) {
+            if ($ts >= $from && $ts <= $to) {
+                $values[$ts] = $value;
+            }
+        }
+        ksort($values);
+        $values = array_values($values);
+
+        $summary = [
+            'avg_' . $field => count($values) ? (int) round(array_sum($values) / count($values)) : null,
+            'max_' . $field => count($values) ? (int) round(max($values)) : null,
+        ];
+        if ($field === 'power') {
+            // Too short for one 30-sample rolling window: the mean is the closest figure, where the
+            // formula alone would give 0.
+            $np = $this->normalisedPower($values);
+            $summary['normalized_power'] = $np === null ? $summary['avg_power'] : (int) round($np);
+        }
+
+        $message_count = count($this->data_mesgs[$mesg_name]['timestamp'] ?? []);
+        foreach ($summary as $key => $value) {
+            if (isset($this->data_mesgs[$mesg_name][$key]) && is_array($this->data_mesgs[$mesg_name][$key])
+                && count($this->data_mesgs[$mesg_name][$key]) === $message_count
+                && array_key_exists($index, $this->data_mesgs[$mesg_name][$key])) {
+                $this->data_mesgs[$mesg_name][$key][$index] = $value;
+            }
+        }
+    }
+
+    /**
+     * Normalised Power over a power stream: 30-sample rolling mean, fourth power, mean, fourth root.
+     * Shared by powerMetrics() and the CX-87 summaries. Samples, not seconds: Stryd records every
+     * second, and powerMetrics() runs on the per-second stream that fixData() builds. Null when the
+     * stream is too short for a single rolling window.
      */
     private function normalisedPower(array $power)
     {
-        $np_values = ($this->php_trader_ext_loaded) ? trader_sma($power, 30) : $this->sma($power, 30);
+        $np_values = ($this->php_trader_ext_loaded) ? (trader_sma($power, 30) ?: []) : $this->sma($power, 30);
 
         $sum = 0.0;
         $count = 0;
@@ -2049,7 +2135,7 @@ class phpFITFileAnalysis
             ++$count;
         }
 
-        return $count === 0 ? 0.0 : pow($sum / $count, 1 / 4);
+        return $count === 0 ? null : pow($sum / $count, 1 / 4);
     }
 
     /**
@@ -3034,7 +3120,7 @@ class phpFITFileAnalysis
         $power_metrics['Average Power'] = array_sum($non_null_power_records) / count($non_null_power_records);
         $power_metrics['Kilojoules'] = ($power_metrics['Average Power'] * count($this->data_mesgs['record']['power'])) / 1000;
 
-        $power_metrics['Normalised Power'] = $this->normalisedPower($this->data_mesgs['record']['power']);
+        $power_metrics['Normalised Power'] = $this->normalisedPower($this->data_mesgs['record']['power']) ?? 0.0;
 
         $power_metrics['Variability Index'] = $power_metrics['Normalised Power'] / $power_metrics['Average Power'];
         $power_metrics['Intensity Factor'] = $power_metrics['Normalised Power'] / $functional_threshold_power;

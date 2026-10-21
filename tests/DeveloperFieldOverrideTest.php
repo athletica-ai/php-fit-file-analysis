@@ -165,6 +165,170 @@ class DeveloperFieldOverrideTest extends \PHPUnit\Framework\TestCase
         $this->assertSame([34, 35], $pFFA->data_mesgs['developer_data']['vertical oscillation']['data']);
     }
 
+    private const LAP = 19;
+    private const FLOAT32 = 0x88;
+
+    /** A Stryd-style "power" description (developer index 0, field $number, base type $type) declaring native 20/7. */
+    private function powerDescription($localType, $number, $type, $name = "power\0", $scale = null)
+    {
+        $fields = [[0, 1, self::UINT8], [1, 1, self::UINT8], [2, 1, self::UINT8], [3, strlen($name), self::STRING], [14, 2, self::UINT16], [15, 1, self::UINT8]];
+        $payload = pack('CCC', 0, $number, $type) . $name . pack('vC', self::RECORD, 7);
+        if ($scale !== null) {
+            $fields[] = [6, 1, self::UINT8];
+            $payload .= pack('C', $scale);
+        }
+
+        return $this->definition($localType, self::FIELD_DESCRIPTION, $fields) . $this->data($localType, $payload);
+    }
+
+    private function developerDataId()
+    {
+        return $this->definition(5, self::DEVELOPER_DATA_ID, [[3, 1, self::UINT8]]) . $this->data(5, pack('C', 0));
+    }
+
+    /** Session or lap message definition: timestamp, start_time, avg, max, normalized power. */
+    private function summaryDefinition($localType, $mesg)
+    {
+        $numbers = $mesg === self::SESSION ? [20, 21, 34] : [19, 20, 33];
+
+        return $this->definition($localType, $mesg, [[253, 4, self::UINT32], [2, 4, self::UINT32], [$numbers[0], 2, self::UINT16], [$numbers[1], 2, self::UINT16], [$numbers[2], 2, self::UINT16]]);
+    }
+
+    private function summary($localType, $start, $end, $avg, $max, $np)
+    {
+        return $this->data($localType, pack('VVvvv', $end, $start, $avg, $max, $np));
+    }
+
+    private function parseBytes($bytes)
+    {
+        return new adriangibbons\phpFITFileAnalysis($this->fitFile($bytes), ['input_is_data' => true, 'units' => 'raw']);
+    }
+
+    /**
+     * Review finding: the override wiped every later record's power, so a brick whose bike leg has a
+     * real power meter and no Stryd lost that leg's power. Two sessions: a run (records 0-39, Stryd
+     * 200 beside watch 300) and a ride (records 40-79, power meter 250, no developer field).
+     */
+    public function testABrickKeepsTheBikeLegsPowerMeterStream()
+    {
+        $bytes = $this->developerDataId() . $this->powerDescription(0, 0, self::UINT16)
+            . $this->definition(1, self::RECORD, [[253, 4, self::UINT32], [7, 2, self::UINT16]], [[0, 2, 0]])
+            . $this->definition(2, self::RECORD, [[253, 4, self::UINT32], [7, 2, self::UINT16]])
+            . $this->summaryDefinition(3, self::SESSION);
+        for ($i = 0; $i < 40; $i++) {
+            $bytes .= $this->data(1, pack('Vvv', 1000 + $i, 300, 200));
+        }
+        $bytes .= $this->summary(3, 1000, 1039, 300, 300, 300);
+        for ($i = 40; $i < 80; $i++) {
+            $bytes .= $this->data(2, pack('Vv', 1000 + $i, 250));
+        }
+        $bytes .= $this->summary(3, 1040, 1079, 250, 250, 250);
+
+        $pFFA = $this->parseBytes($bytes);
+        $power = $pFFA->data_mesgs['record']['power'];
+
+        $this->assertSame(200, $power[$this->ts(0)], 'the run leg carries Stryd');
+        $this->assertSame(250, $power[$this->ts(40)], 'the bike leg keeps its power meter');
+        $this->assertCount(80, $power);
+        $this->assertSame([200, 250], $pFFA->data_mesgs['session']['avg_power'], 'each session summarises its own stream');
+    }
+
+    /** Review finding: laps kept the watch's avg/max/normalized power while the session moved to Stryd. */
+    public function testLapPowerFollowsTheOverridingStream()
+    {
+        $bytes = $this->developerDataId() . $this->powerDescription(0, 0, self::UINT16)
+            . $this->definition(1, self::RECORD, [[253, 4, self::UINT32], [7, 2, self::UINT16]], [[0, 2, 0]])
+            . $this->summaryDefinition(3, self::LAP) . $this->summaryDefinition(4, self::SESSION);
+        for ($i = 0; $i < 60; $i++) {
+            $bytes .= $this->data(1, pack('Vvv', 1000 + $i, 300, $i < 30 ? 200 : 220));
+            if ($i === 29 || $i === 59) {
+                $bytes .= $this->summary(3, 1000 + $i - 29, 1000 + $i, 300, 300, 300);
+            }
+        }
+        $bytes .= $this->summary(4, 1000, 1059, 300, 300, 300);
+
+        $lap = $this->parseBytes($bytes)->data_mesgs['lap'];
+
+        $this->assertSame([200, 220], $lap['avg_power']);
+        $this->assertSame([200, 220], $lap['max_power']);
+        $this->assertSame([200, 220], $lap['normalized_power'], 'a constant stream normalises to itself');
+    }
+
+    /**
+     * Review finding: with the Stryd field installed but no pod paired every developer value is
+     * invalid; the stream was emptied while the summary kept the watch's figures. With no valid
+     * developer value the file is a watch-only file, stream and summary alike.
+     */
+    public function testAnOverrideWithNoValidValueLeavesTheWatchStreamAndSummary()
+    {
+        $bytes = $this->developerDataId() . $this->powerDescription(0, 0, self::UINT16)
+            . $this->definition(1, self::RECORD, [[253, 4, self::UINT32], [7, 2, self::UINT16]], [[0, 2, 0]])
+            . $this->summaryDefinition(3, self::SESSION);
+        for ($i = 0; $i < 40; $i++) {
+            $bytes .= $this->data(1, pack('Vvv', 1000 + $i, 300, 0xFFFF));
+        }
+        $bytes .= $this->summary(3, 1000, 1039, 300, 300, 300);
+
+        $pFFA = $this->parseBytes($bytes);
+
+        $this->assertCount(40, $pFFA->data_mesgs['record']['power']);
+        $this->assertSame(300, $pFFA->data_mesgs['session']['avg_power']);
+    }
+
+    /** Review finding: below 30 samples normalised power came out as 0 and replaced the device's figure. */
+    public function testAShortFilesNormalisedPowerIsTheMeanNotZero()
+    {
+        $bytes = $this->developerDataId() . $this->powerDescription(0, 0, self::UINT16)
+            . $this->definition(1, self::RECORD, [[253, 4, self::UINT32], [7, 2, self::UINT16]], [[0, 2, 0]])
+            . $this->summaryDefinition(3, self::SESSION);
+        for ($i = 0; $i < 10; $i++) {
+            $bytes .= $this->data(1, pack('Vvv', 1000 + $i, 300, 200));
+        }
+        $bytes .= $this->summary(3, 1000, 1009, 300, 300, 300);
+
+        $this->assertSame(200, $this->parseBytes($bytes)->data_mesgs['session']['normalized_power']);
+    }
+
+    /**
+     * Review findings: two developer fields declaring power, where the later one is invalid on a
+     * record, erased the earlier one's valid value; and records written before the description
+     * kept the watch's value inside an overridden session.
+     */
+    public function testTheFirstValidDeclaredValueWinsAndEarlierRecordsCarryNoWatchValue()
+    {
+        $bytes = $this->developerDataId()
+            . $this->definition(2, self::RECORD, [[253, 4, self::UINT32], [7, 2, self::UINT16]])
+            . $this->data(2, pack('Vv', 1000, 300))
+            . $this->powerDescription(0, 0, self::UINT16) . $this->powerDescription(4, 1, self::UINT16, "power2\0")
+            . $this->definition(1, self::RECORD, [[253, 4, self::UINT32], [7, 2, self::UINT16]], [[0, 2, 0], [1, 2, 0]]);
+        for ($i = 1; $i < 40; $i++) {
+            $bytes .= $this->data(1, pack('Vvvv', 1000 + $i, 300, 200, $i === 5 ? 0xFFFF : 999));
+        }
+
+        $power = $this->parseBytes($bytes)->data_mesgs['record']['power'];
+
+        $this->assertArrayNotHasKey($this->ts(0), $power, 'a record before the description carries no watch value');
+        $this->assertSame(200, $power[$this->ts(5)], 'a later invalid declarer does not erase the first');
+        $this->assertSame(200, $power[$this->ts(6)], 'the first valid declarer wins over a later valid one');
+    }
+
+    /** Review finding: a description with scale 0 divided by zero; a float32 invalid value became NaN. */
+    public function testAZeroScaleAndANanValueDoNotBreakTheParse()
+    {
+        $bytes = $this->developerDataId() . $this->powerDescription(0, 0, self::UINT16, "power\0", 0)
+            . $this->definition(1, self::RECORD, [[253, 4, self::UINT32], [7, 2, self::UINT16]], [[0, 2, 0]]);
+        $bytes .= $this->data(1, pack('Vvv', 1000, 300, 200)) . $this->data(1, pack('Vvv', 1001, 300, 210));
+        $this->assertSame(200, $this->parseBytes($bytes)->data_mesgs['record']['power'][$this->ts(0)]);
+
+        $bytes = $this->developerDataId() . $this->powerDescription(0, 0, self::FLOAT32)
+            . $this->definition(1, self::RECORD, [[253, 4, self::UINT32], [7, 2, self::UINT16]], [[0, 4, 0]]);
+        $bytes .= $this->data(1, pack('Vvg', 1000, 300, 200.0)) . $this->data(1, pack('VvV', 1001, 300, 0xFFFFFFFF))
+            . $this->data(1, pack('Vvg', 1002, 300, 210.0));
+        $power = $this->parseBytes($bytes)->data_mesgs['record']['power'];
+        $this->assertEquals(200, $power[$this->ts(0)]);
+        $this->assertArrayNotHasKey($this->ts(1), $power, 'NaN is no value');
+    }
+
     /** Before CX-87 a developer field with no field description was skipped without advancing the read pointer. */
     public function testAnUndescribedDeveloperFieldIsSkippedWithoutMisreadingWhatFollows()
     {
