@@ -280,6 +280,41 @@ class DeveloperFieldOverrideTest extends \PHPUnit\Framework\TestCase
         $this->assertSame(300, $pFFA->data_mesgs['session']['avg_power']);
     }
 
+    /**
+     * Production: some files declare the override and write 0 on every record. Those zeros replaced
+     * the watch's power for the whole session; the session is now left as the watch wrote it.
+     */
+    public function testAnOverrideWritingOnlyZerosLeavesTheWatchStreamAndSummary()
+    {
+        $bytes = $this->developerDataId() . $this->powerDescription(0, 0, self::UINT16)
+            . $this->definition(1, self::RECORD, [[253, 4, self::UINT32], [7, 2, self::UINT16]], [[0, 2, 0]])
+            . $this->summaryDefinition(3, self::SESSION);
+        for ($i = 0; $i < 40; $i++) {
+            $bytes .= $this->data(1, pack('Vvv', 1000 + $i, 300, 0));
+        }
+        $bytes .= $this->summary(3, 1000, 1039, 300, 300, 300);
+
+        $pFFA = $this->parseBytes($bytes);
+
+        $this->assertSame(300, $pFFA->data_mesgs['record']['power'][$this->ts(0)]);
+        $this->assertSame(300, $pFFA->data_mesgs['session']['avg_power']);
+    }
+
+    /** Zeros inside a session that has Stryd readings (standing still) are Stryd's, not the watch's. */
+    public function testZerosBesideStrydReadingsAreKept()
+    {
+        $bytes = $this->developerDataId() . $this->powerDescription(0, 0, self::UINT16)
+            . $this->definition(1, self::RECORD, [[253, 4, self::UINT32], [7, 2, self::UINT16]], [[0, 2, 0]]);
+        for ($i = 0; $i < 40; $i++) {
+            $bytes .= $this->data(1, pack('Vvv', 1000 + $i, 300, $i < 10 ? 0 : 200));
+        }
+
+        $power = $this->parseBytes($bytes)->data_mesgs['record']['power'];
+
+        $this->assertSame(0, $power[$this->ts(0)]);
+        $this->assertSame(200, $power[$this->ts(10)]);
+    }
+
     /** Review finding: below 30 samples normalised power came out as 0 and replaced the device's figure. */
     public function testAShortFilesNormalisedPowerIsTheMeanNotZero()
     {

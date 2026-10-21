@@ -2153,8 +2153,9 @@ class phpFITFileAnalysis
      * CX-87: replace a native record field with the developer values that declare it, one session
      * at a time.
      *
-     * A session is overridden only when the developer field carries at least one valid value inside
-     * it. Within such a session every record carries the developer value or nothing -- never the
+     * A session is overridden only when the developer field carries at least one valid value above 0
+     * inside it: some apps declare the override and write 0 on every record, which would otherwise
+     * zero the session's power (seen on four athletes' files in production). Within such a session every record carries the developer value or nothing -- never the
      * watch's own value, because the two are not on one scale. That includes, deliberately, the rest
      * of a session after a pod drops out: a power-duration profile must come from one source, and
      * missing samples leave a best unchanged where foreign ones would lift it. Outside an overridden
@@ -2184,14 +2185,14 @@ class phpFITFileAnalysis
             $overridden = [];
             foreach ($sessions as $session_index => [$from, $to]) {
                 $in_window = $this->keysInWindow($timestamps, $from, $to);
-                $has_valid = false;
+                $has_reading = false;
                 foreach ($in_window as $ts) {
-                    if (isset($dev_stream[$ts])) {
-                        $has_valid = true;
+                    if (($dev_stream[$ts] ?? 0) > 0) {
+                        $has_reading = true;
                         break;
                     }
                 }
-                if (!$has_valid) {
+                if (!$has_reading) {
                     continue;
                 }
 
