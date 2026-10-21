@@ -1938,10 +1938,12 @@ class phpFITFileAnalysis
         }
 
         // CX-87: a record's valid value for the native field it replaces; the first declarer with
-        // one wins.
+        // one wins, except that a later declarer's reading above 0 replaces an earlier 0 (an app
+        // that declares power and writes 0 must not hide Stryd's values on the same record).
         if ($mesg_name === 'record' && $record_timestamp !== null && (is_int($value) || is_float($value))) {
             $native = $this->nativeRecordFieldOverriddenBy($description);
-            if ($native !== null && !isset($this->dev_override_streams[$native][$record_timestamp])) {
+            $kept = $native !== null ? ($this->dev_override_streams[$native][$record_timestamp] ?? null) : null;
+            if ($native !== null && ($kept === null || ($kept == 0 && $value > 0))) {
                 $this->dev_override_streams[$native][$record_timestamp] = $value;
             }
         }
