@@ -56,7 +56,7 @@ class phpFITFileAnalysis
     private array $hr_messages = [];               // hr (132) messages as read: timestamp, event_timestamp, event_timestamp_12, filtered_bpm; see processHrMessages().
     private array $undescribed_dev_values = [];    // Record developer fields read before their field_description: [index][number] => [[pos, size, architecture, record timestamp], ...].
     private array $dev_override_streams = [];      // CX-87: [native record field][declarer (developer data index * 256 + field number)][record timestamp] => valid developer value.
-    private array $applied_overrides = [];         // CX-87: native record fields the override actually replaced in some session.
+    private array $applied_overrides = [];         // CX-87: [native record field][declarer] => true for each declarer that supplied some session.
     private array $options = [];                   // Options provided to __construct(), with defaults filled in.
     private string $file_contents = '';            // The whole FIT file, as read. See __construct().
     private int $file_pointer = 0;                 // Points to the location in the file that shall be read next.
@@ -1595,7 +1595,7 @@ class phpFITFileAnalysis
             $description = $this->dev_field_descriptions[$field_defn['developer_data_index']][$field_defn['field_definition_number']] ?? null;
             if ($description !== null && isset($description['field_name'])) {
                 $dev_values[] = $this->developerValues($description, $field_defn['size'], $pos, $architecture);
-                $dev_declarers[] = $field_defn['developer_data_index'] * 256 + $field_defn['field_definition_number'];
+                $dev_declarers[] = self::declarerKey($field_defn['developer_data_index'], $field_defn['field_definition_number']);
             } elseif ($global_mesg_num === 20) {
                 $undescribed[] = [$field_defn['developer_data_index'], $field_defn['field_definition_number'], $pos, $field_defn['size']];
             }
@@ -1882,7 +1882,7 @@ class phpFITFileAnalysis
             foreach ($this->undescribed_dev_values[$developer_data_index][$field_definition_number] ?? [] as [$pos, $size, $architecture, $record_timestamp]) {
                 [, $raw, $value] = $this->developerValues($description, $size, $pos, $architecture);
                 $this->storeDeveloperValue($description, $raw, $value, 'record', $record_timestamp);
-                $this->collectOverrideValue($description, $developer_data_index * 256 + $field_definition_number, $value, $record_timestamp);
+                $this->collectOverrideValue($description, self::declarerKey($developer_data_index, $field_definition_number), $value, $record_timestamp);
             }
         }
         unset($this->undescribed_dev_values[$developer_data_index][$field_definition_number]);
@@ -1947,8 +1947,15 @@ class phpFITFileAnalysis
     /**
      * CX-87: a record's valid value for the native field its declaration replaces, kept per
      * declarer so applyDeveloperOverrides() can take one declarer for a whole session. Two records
-     * on one timestamp: the later value wins, as it does for native record fields and by_mesg.
+     * on one timestamp: the later valid value wins, as the later value does for native record
+     * fields (an invalid one is no value here, where by_mesg stores it as null).
      */
+    /** CX-87: one developer field, as a sortable key: developer data index, then field number. */
+    private static function declarerKey(int $developer_data_index, int $field_definition_number): int
+    {
+        return $developer_data_index * 256 + $field_definition_number;
+    }
+
     private function collectOverrideValue(array $description, int $declarer, mixed $value, int $record_timestamp): void
     {
         if (!is_int($value) && !is_float($value)) {
@@ -2120,17 +2127,17 @@ class phpFITFileAnalysis
      * stream under its own name when the record carries no field of that name, as this library has
      * always done. The copy is developer_data's flat 'data' list, raw. Stryd's cadence on a watch
      * without native cadence arrives this way, and athletica-app's FitFileParser::getMetricArray()
-     * reads such lists. A declaration the CX-87 override applied is not copied: its values are
-     * already in the native stream.
+     * reads such lists. A declarer the CX-87 override took for some session is not copied: its
+     * values are already in the native stream. One it never took is copied as before.
      */
     private function copyDeveloperDeclarations(): void
     {
-        foreach ($this->dev_field_descriptions as $developer_data_index) {
-            foreach ($developer_data_index as $description) {
+        foreach ($this->dev_field_descriptions as $developer_data_index => $fields) {
+            foreach ($fields as $field_definition_number => $description) {
                 if (!isset($description['native_field_num'], $description['field_name'])) {
                     continue;
                 }
-                if (isset($this->applied_overrides[$this->nativeRecordFieldOverriddenBy($description) ?? ''])) {
+                if (isset($this->applied_overrides[$this->nativeRecordFieldOverriddenBy($description) ?? ''][self::declarerKey($developer_data_index, $field_definition_number)])) {
                     continue;
                 }
                 if (isset($this->data_mesgs['record'][$description['field_name']])) {
@@ -2169,8 +2176,10 @@ class phpFITFileAnalysis
      * A session is overridden only when a declarer carries at least one value above 0 inside it:
      * some apps declare the override and write 0 on every record (185 of 782 dual files in
      * production), which would otherwise zero the session's power. One declarer supplies the whole
-     * session: the first, by developer data index then field number, with a reading in it, so two
-     * apps' power never mix and the choice does not depend on where a description sits in the file.
+     * session, so two apps' power never mix: the one with the most readings above 0 in it (an app
+     * writing 0 with a stray reading does not beat Stryd recording throughout), ties going to the
+     * lower developer data index, then field number. Where the chosen declarer has no value, the
+     * record has no power, even if another declarer has one.
      * Within such a session every record carries that declarer's value or nothing -- never the
      * watch's own value, because the two are not on one scale. That includes, deliberately, the rest
      * of a session after a pod drops out: a power-duration profile must come from one source, and
@@ -2203,17 +2212,23 @@ class phpFITFileAnalysis
             foreach ($sessions as $session_index => [$from, $to]) {
                 $in_window = $this->keysInWindow($timestamps, $from, $to);
                 $dev_stream = null;
-                foreach ($declarers as $stream) {
+                $chosen = null;
+                $most = 0;
+                foreach ($declarers as $declarer => $stream) {
+                    $readings = 0;
                     foreach ($in_window as $ts) {
                         if (($stream[$ts] ?? 0) > 0) {
-                            $dev_stream = $stream;
-                            break 2;
+                            ++$readings;
                         }
+                    }
+                    if ($readings > $most) {
+                        [$dev_stream, $chosen, $most] = [$stream, $declarer, $readings];
                     }
                 }
                 if ($dev_stream === null) {
                     continue;
                 }
+                $this->applied_overrides[$field][$chosen] = true;
 
                 foreach ($in_window as $ts) {
                     if (isset($dev_stream[$ts])) {
@@ -2227,7 +2242,6 @@ class phpFITFileAnalysis
             if ($overridden === []) {
                 continue;
             }
-            $this->applied_overrides[$field] = true;
 
             // A timestamp the native stream had no value for was appended at the end; restore time order.
             ksort($this->data_mesgs['record'][$field]);
