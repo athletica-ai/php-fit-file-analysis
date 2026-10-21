@@ -355,6 +355,22 @@ class DeveloperFieldOverrideTest extends \PHPUnit\Framework\TestCase
         $this->assertSame(200, $power[$this->ts(39)]);
     }
 
+    /** Two records on one timestamp: the later value wins, as for the native fields and developer_data's by_mesg. */
+    public function testOnADuplicateTimestampTheLaterValueWins()
+    {
+        $bytes = $this->developerDataId() . $this->powerDescription(0, 0, self::UINT16)
+            . $this->definition(1, self::RECORD, [[253, 4, self::UINT32], [7, 2, self::UINT16]], [[0, 2, 0]]);
+        for ($i = 0; $i < 40; $i++) {
+            $bytes .= $this->data(1, pack('Vvv', 1000 + $i, 300, 200));
+        }
+        $bytes .= $this->data(1, pack('Vvv', 1005, 310, 150));
+
+        $pFFA = $this->parseBytes($bytes);
+
+        $this->assertSame(150, $pFFA->data_mesgs['record']['power'][$this->ts(5)]);
+        $this->assertSame(150, $pFFA->data_mesgs['developer_data']['power']['by_mesg']['record'][$this->ts(5)]);
+    }
+
     /** Zeros inside a session that has Stryd readings (standing still) are Stryd's, not the watch's. */
     public function testZerosBesideStrydReadingsAreKept()
     {

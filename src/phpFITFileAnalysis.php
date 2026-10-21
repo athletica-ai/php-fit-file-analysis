@@ -1946,8 +1946,8 @@ class phpFITFileAnalysis
 
     /**
      * CX-87: a record's valid value for the native field its declaration replaces, kept per
-     * declarer so applyDeveloperOverrides() can take one declarer for a whole session. A declarer's
-     * first valid value on a timestamp wins.
+     * declarer so applyDeveloperOverrides() can take one declarer for a whole session. Two records
+     * on one timestamp: the later value wins, as it does for native record fields and by_mesg.
      */
     private function collectOverrideValue(array $description, int $declarer, mixed $value, int $record_timestamp): void
     {
@@ -1955,7 +1955,7 @@ class phpFITFileAnalysis
             return;
         }
         $native = $this->nativeRecordFieldOverriddenBy($description);
-        if ($native !== null && !isset($this->dev_override_streams[$native][$declarer][$record_timestamp])) {
+        if ($native !== null) {
             $this->dev_override_streams[$native][$declarer][$record_timestamp] = $value;
         }
     }
