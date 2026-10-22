@@ -421,6 +421,20 @@ class DeveloperFieldOverrideTest extends \PHPUnit\Framework\TestCase
         $this->assertArrayHasKey('other power', $record);
     }
 
+    /** CX-87: callers can tell a file whose power was replaced from one left as the watch wrote it. */
+    public function testAppliedDeveloperOverridesNamesTheReplacedFields()
+    {
+        $this->assertSame(['power'], $this->parse()->appliedDeveloperOverrides());
+        $this->assertSame([], $this->parse(['overwrite_with_dev_data' => false])->appliedDeveloperOverrides());
+
+        $zeros = $this->developerDataId() . $this->powerDescription(0, 0, self::UINT16)
+            . $this->definition(1, self::RECORD, [[253, 4, self::UINT32], [7, 2, self::UINT16]], [[0, 2, 0]]);
+        for ($i = 0; $i < 40; $i++) {
+            $zeros .= $this->data(1, pack('Vvv', 1000 + $i, 300, 0));
+        }
+        $this->assertSame([], $this->parseBytes($zeros)->appliedDeveloperOverrides(), 'all-zero Stryd replaces nothing');
+    }
+
     /** Zeros inside a session that has Stryd readings (standing still) are Stryd's, not the watch's. */
     public function testZerosBesideStrydReadingsAreKept()
     {

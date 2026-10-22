@@ -2896,6 +2896,18 @@ class phpFITFileAnalysis
 
         return $index === null ? null : ($values[$index] ?? null);
     }
+    /**
+     * CX-87: the native record fields (e.g. 'power') that a developer field replaced in at least one
+     * session, so a caller can tell a file carrying Stryd's power from one carrying only the watch's.
+     * Empty when no override was applied (none declared, none with a reading, or the option off).
+     *
+     * @return list<string>
+     */
+    public function appliedDeveloperOverrides(): array
+    {
+        return array_keys($this->applied_overrides);
+    }
+
     public function sport(?int $index = null)
     {
         $tmp = $this->enumData('sport', $this->data_mesgs['session']['sport'] ?? ($this->data_mesgs['sport']['sport'] ?? 0));
