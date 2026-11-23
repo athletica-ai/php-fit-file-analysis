@@ -2843,8 +2843,9 @@ class phpFITFileAnalysis
         if (isset($this->enum_data[$type][$value])) {
             return $this->enum_data[$type][$value];
         }
-        $name = Profile::TYPES[self::ENUM_TYPE_ALIASES[$type] ?? $type][$value] ?? null;
-        if ($name === null || ($type === 'product' && str_ends_with($name, self::UNNAMED_PRODUCT_SUFFIX))) {
+        $sdk_type = self::ENUM_TYPE_ALIASES[$type] ?? $type;
+        $name = Profile::TYPES[$sdk_type][$value] ?? null;
+        if ($name === null || ($sdk_type === 'garmin_product' && str_ends_with($name, self::UNNAMED_PRODUCT_SUFFIX))) {
             return 'unknown';
         }
 

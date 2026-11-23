@@ -38,18 +38,25 @@ jobs:
             echo "Unexpected latest release tag: $latest" >&2
             exit 1
           fi
+          # Report only a release newer than the pin: Garmin's "latest" can lag a release we pinned.
+          newer=false
+          if [ "$latest" != "$pinned" ] && [ "$(printf '%s\n%s\n' "$pinned" "$latest" | sort -V | tail -1)" = "$latest" ]; then
+            newer=true
+          fi
           echo "pinned=$pinned" >> "$GITHUB_OUTPUT"
           echo "latest=$latest" >> "$GITHUB_OUTPUT"
-          echo "Pinned $pinned, latest $latest"
+          echo "newer=$newer" >> "$GITHUB_OUTPUT"
+          echo "Pinned $pinned, latest $latest, newer: $newer"
 
       - name: Summarise the new profile
-        if: steps.versions.outputs.latest != steps.versions.outputs.pinned
+        id: summarise
+        if: steps.versions.outputs.newer == 'true'
         env:
           LATEST: ${{ steps.versions.outputs.latest }}
         run: php bin/generate-profile.php --version="$LATEST" --summary=summary.md
 
       - name: Report the new release
-        if: steps.versions.outputs.latest != steps.versions.outputs.pinned
+        if: steps.versions.outputs.newer == 'true'
         env:
           LATEST: ${{ steps.versions.outputs.latest }}
           PINNED: ${{ steps.versions.outputs.pinned }}
@@ -70,3 +77,9 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           echo "::error title=FIT SDK update available::Garmin released FIT SDK $LATEST; this library is pinned to $PINNED. See the run summary for what changes."
           exit 1
+
+      # Any other failure (the GitHub API, an unexpected tag, the generator) is a broken watch, not a
+      # release: say so, so it isn't mistaken for the expected weekly red.
+      - name: Flag a broken watch
+        if: failure() && (steps.versions.outputs.newer != 'true' || steps.summarise.outcome == 'failure')
+        run: echo "::error title=FIT SDK watch is broken::The watch failed before it could report (GitHub API, release tag or generator; see the failed step). Fix it, or the watch stops reporting releases."

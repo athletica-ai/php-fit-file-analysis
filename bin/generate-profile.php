@@ -196,8 +196,8 @@ function previousProfile(string $path): array
 
 /**
  * What changed between the profile in src/Profile.php and the new one: messages and fields added
- * or removed, changes to a field's name, type, scale, offset or units (which change values the
- * library already returns), and enum values added or renamed.
+ * or removed, changes to a field's name, type, scale, offset, units, components, accumulation or
+ * subfields (which change values or keys the library already returns), and enum values added or renamed.
  */
 function summary(array $previous, string $version, array $messages, array $types): string
 {
@@ -220,6 +220,14 @@ function summary(array $previous, string $version, array $messages, array $types
                 if ($old_field[$key] !== $field[$key]) {
                     $changed[] = "- **{$message['name']}.{$old_field['name']}** ($num/$field_num) $key: `" . var_export($old_field[$key], true) . '` → `' . var_export($field[$key], true) . '`';
                 }
+            }
+            foreach (['array', 'base_type', 'components', 'accumulated'] as $key) {
+                if (($old_field[$key] ?? null) !== ($field[$key] ?? null)) {
+                    $changed[] = "- **{$message['name']}.{$old_field['name']}** ($num/$field_num) $key: `" . json_encode($old_field[$key] ?? null) . '` → `' . json_encode($field[$key] ?? null) . '`';
+                }
+            }
+            foreach (subfieldChanges($old_field['subfields'] ?? [], $field['subfields'] ?? [], $message, $types) as $change) {
+                $changed[] = "- **{$message['name']}.{$old_field['name']}** ($num/$field_num) $change";
             }
         }
         foreach (array_diff_key($old['fields'], $message['fields']) as $field_num => $field) {
@@ -265,6 +273,45 @@ function summary(array $previous, string $version, array $messages, array $types
     }
 
     return implode("\n", $lines) . "\n";
+}
+
+/**
+ * Subfields added, removed or changed on one field. A new map entry (e.g. session total_cycles
+ * gaining total_reps for sub_sport station) adds a key to decoded messages, so it is a change.
+ */
+function subfieldChanges(array $old, array $new, array $message, array $types): array
+{
+    $old = array_column($old, null, 'name');
+    $new = array_column($new, null, 'name');
+    $when = function (array $maps) use ($message, $types): string {
+        return implode(', ', array_map(function ($m) use ($message, $types) {
+            $ref = $message['fields'][$m[0]] ?? null;
+            return $ref === null ? "field {$m[0]}={$m[1]}" : $ref['name'] . '=' . ($types[$ref['type']][$m[1]] ?? $m[1]);
+        }, $maps));
+    };
+    $changes = [];
+    foreach (array_diff_key($new, $old) as $name => $sub) {
+        $changes[] = "new subfield `$name` when " . $when($sub['map']);
+    }
+    foreach (array_diff_key($old, $new) as $name => $sub) {
+        $changes[] = "removed subfield `$name`";
+    }
+    foreach (array_intersect_key($new, $old) as $name => $sub) {
+        $added = array_values(array_filter($sub['map'], fn($m) => !in_array($m, $old[$name]['map'], true)));
+        $removed = array_values(array_filter($old[$name]['map'], fn($m) => !in_array($m, $sub['map'], true)));
+        if ($added) {
+            $changes[] = "subfield `$name` now also when " . $when($added);
+        }
+        if ($removed) {
+            $changes[] = "subfield `$name` no longer when " . $when($removed);
+        }
+        $rest = fn($s) => array_diff_key($s, ['map' => true]);
+        if ($rest($sub) !== $rest($old[$name])) {
+            $changes[] = "subfield `$name`: `" . json_encode($rest($old[$name])) . '` → `' . json_encode($rest($sub)) . '`';
+        }
+    }
+
+    return $changes;
 }
 
 /**

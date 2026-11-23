@@ -51,6 +51,7 @@ class EnumDataTest extends \PHPUnit\Framework\TestCase
         // 23 and 24 arrived in SDK 21.222.0 (e.g. Suunto Race / Vertical, Wahoo ELEMNT BOLT / ROAM).
         foreach ([13, 15, 16, 22, 23, 24] as $product_id) {
             $this->assertEquals('unknown', $this->pFFA->enumData('product', $product_id));
+            $this->assertEquals('unknown', $this->pFFA->enumData('garmin_product', $product_id));
         }
     }
 
