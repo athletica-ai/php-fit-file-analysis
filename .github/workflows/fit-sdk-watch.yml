@@ -2,9 +2,10 @@ name: FIT SDK watch
 
 # Garmin's FIT SDK is the source of truth for src/Profile.php (see bin/generate-profile.php).
 # Weekly, compare the version pinned in bin/fit-sdk-version.txt with Garmin's latest release and,
-# when they differ, open (or update) one issue with a summary of what the new profile changes.
-# It never opens a PR: a profile change can change values the app has already stored, so a person
-# regenerates, reviews and merges.
+# when they differ, write a summary of what the new profile changes to the run's summary page and
+# fail the run, so GitHub emails the alert. It stays red each week until the pin is updated.
+# Issues are disabled on this repo, so it does not open one. It never opens a PR either: a profile
+# change can change values the app has already stored, so a person regenerates, reviews and merges.
 
 on:
   schedule:
@@ -13,7 +14,6 @@ on:
 
 permissions:
   contents: read
-  issues: write
 
 jobs:
   check:
@@ -38,29 +38,35 @@ jobs:
             echo "Unexpected latest release tag: $latest" >&2
             exit 1
           fi
+          # Report only a release newer than the pin: Garmin's "latest" can lag a release we pinned.
+          newer=false
+          if [ "$latest" != "$pinned" ] && [ "$(printf '%s\n%s\n' "$pinned" "$latest" | sort -V | tail -1)" = "$latest" ]; then
+            newer=true
+          fi
           echo "pinned=$pinned" >> "$GITHUB_OUTPUT"
           echo "latest=$latest" >> "$GITHUB_OUTPUT"
-          echo "Pinned $pinned, latest $latest"
+          echo "newer=$newer" >> "$GITHUB_OUTPUT"
+          echo "Pinned $pinned, latest $latest, newer: $newer"
 
       - name: Summarise the new profile
-        if: steps.versions.outputs.latest != steps.versions.outputs.pinned
+        id: summarise
+        if: steps.versions.outputs.newer == 'true'
         env:
           LATEST: ${{ steps.versions.outputs.latest }}
         run: php bin/generate-profile.php --version="$LATEST" --summary=summary.md
 
-      - name: Open or update the issue
-        if: steps.versions.outputs.latest != steps.versions.outputs.pinned
+      - name: Report the new release
+        if: steps.versions.outputs.newer == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
           LATEST: ${{ steps.versions.outputs.latest }}
           PINNED: ${{ steps.versions.outputs.pinned }}
         run: |
           {
-            echo "Garmin released FIT SDK **$LATEST**; this library is pinned to **$PINNED**."
+            echo "## FIT SDK $LATEST released (pinned: $PINNED)"
             echo
             echo "To update:"
             echo
-            echo '1. `php bin/generate-profile.php --version='"$LATEST"'` (rewrites `src/Profile.php` and `bin/fit-sdk-version.txt`)'
+            echo '1. `composer profile -- --version='"$LATEST"' --summary=summary.md` (rewrites `src/Profile.php` and `bin/fit-sdk-version.txt`)'
             echo '2. Review the summary below. Under "Changed or removed", anything touching a field the app reads changes values it may already have stored.'
             echo '3. Add display names for new devices or sports to `$enum_data` if wanted (others fall back to the SDK name).'
             echo '4. `composer test`, then open a PR.'
@@ -68,12 +74,12 @@ jobs:
             echo "Release: https://github.com/garmin/fit-python-sdk/releases/tag/$LATEST"
             echo
             cat summary.md
-          } > body.md
-          title="FIT SDK $LATEST released (pinned: $PINNED)"
-          gh label create fit-sdk --color 0E8A16 --description 'Garmin FIT SDK release to review' --force
-          existing="$(gh issue list --state open --label fit-sdk --json number --jq '.[0].number // empty')"
-          if [ -n "$existing" ]; then
-            gh issue edit "$existing" --title "$title" --body-file body.md
-          else
-            gh issue create --title "$title" --label fit-sdk --body-file body.md
-          fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error title=FIT SDK update available::Garmin released FIT SDK $LATEST; this library is pinned to $PINNED. See the run summary for what changes."
+          exit 1
+
+      # Any other failure (the GitHub API, an unexpected tag, the generator) is a broken watch, not a
+      # release: say so, so it isn't mistaken for the expected weekly red.
+      - name: Flag a broken watch
+        if: failure() && (steps.versions.outputs.newer != 'true' || steps.summarise.outcome == 'failure')
+        run: echo "::error title=FIT SDK watch is broken::The watch failed before it could report (GitHub API, release tag or generator; see the failed step). Fix it, or the watch stops reporting releases."
