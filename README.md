@@ -398,7 +398,7 @@ The analysis methods count each sample as one second. For files recorded with sm
 Garmin's FIT SDK is the source of truth: <https://developer.garmin.com/fit/> and its profile, e.g. [fit-python-sdk `profile.py`](https://github.com/garmin/fit-python-sdk/blob/main/garmin_fit_sdk/profile.py) (the same profile as the JavaScript SDK's `profile.js`).
 
  - `composer profile -- --version=X.Y.Z` regenerates `src/Profile.php` and `bin/fit-sdk-version.txt` for that SDK release (add `--summary=FILE` for a Markdown summary of what changed; `composer profile-check` fails if `src/Profile.php` is not what the pinned version generates, as CI checks).
- - The **FIT SDK watch** workflow (`.github/workflows/fit-sdk-watch.yml`) compares the pinned version with Garmin's latest release every Monday and opens (or updates) one issue, labelled `fit-sdk`, with that summary. Review it, especially any changed scale, offset or units of a field you already store, then regenerate, run the tests and open a PR.
+ - The **FIT SDK watch** workflow (`.github/workflows/fit-sdk-watch.yml`) compares the pinned version with Garmin's latest release every Monday. When a newer release is out, the run fails (so GitHub emails an alert) and its summary page shows that profile summary. Review it, especially any changed scale, offset or units of a field you already store, then regenerate, run the tests and open a PR. The run stays red until the pin is updated.
  - Display names for new devices or sports can be added to `$enum_data`; without one, `enumData()` returns the SDK's name.
 
 ## Development
