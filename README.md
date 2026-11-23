@@ -3,7 +3,7 @@
 
 A PHP (>= 8.3) class for analysing FIT files created by Garmin GPS devices.
 
-Messages, fields, scales, units and enumerated types come from Garmin's official FIT SDK: `src/Profile.php` is generated from the SDK's profile (currently **21.218.0**, pinned in `bin/fit-sdk-version.txt`; `Profile::VERSION` at runtime). See [Keeping up with the FIT SDK](#keeping-up-with-the-fit-sdk).
+Messages, fields, scales, units and enumerated types come from Garmin's official FIT SDK: `src/Profile.php` is generated from the SDK's profile (currently **21.222.0**, pinned in `bin/fit-sdk-version.txt`; `Profile::VERSION` at runtime). See [Keeping up with the FIT SDK](#keeping-up-with-the-fit-sdk).
 
 [Live demonstration](http://adriangibbons.com/php-fit-file-analysis/demo/) (Right-click and Open in new tab)
 

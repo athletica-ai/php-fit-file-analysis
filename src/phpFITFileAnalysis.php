@@ -445,8 +445,8 @@ class phpFITFileAnalysis
         ],
         'pwr_zone_calc' => [0 => 'custom', 1 => 'percent_ftp'],
         // Source of truth for product IDs: garminProduct in Garmin's FIT SDK profile
-        // (https://github.com/garmin/fit-javascript-sdk/blob/main/src/profile.js). Last checked against v21.218.0.
-        // SDK IDs 13, 15, 16 and 22 (single-byte ANT+ sensor IDs) are left out on purpose: this table is looked up
+        // (https://github.com/garmin/fit-javascript-sdk/blob/main/src/profile.js). Last checked against v21.222.0.
+        // SDK IDs 13, 15, 16, 22, 23 and 24 (single-byte ANT+ sensor IDs) are left out on purpose: this table is looked up
         // whatever the manufacturer, and those IDs are Suunto, Polar and Wahoo watches, which callers name only
         // when this returns 'unknown'.
         'product' => [  // Have formatted for devices known to use FIT format. (Original text commented-out).
@@ -1151,10 +1151,11 @@ class phpFITFileAnalysis
     // capitalises with spaces for underscores, as $enum_data does for them.
     private const ENUM_TYPE_ALIASES = ['product' => 'garmin_product'];
     private const CAPITALISED_ENUM_TYPES = ['sport', 'sub_sport'];
-    // APP-2016: single-byte ANT+ sensor product IDs, left 'unknown' rather than named from the SDK.
-    // They are Suunto, Polar and Wahoo watches too, which athletica-app names only when this
-    // returns 'unknown' (see the comment on $enum_data['product']).
-    private const UNNAMED_PRODUCT_IDS = [13, 15, 16, 22];
+    // APP-2016: single-byte ANT+ sensor product IDs (SDK names ending in this) are left 'unknown'
+    // rather than named from the SDK, unless $enum_data names them. They are Suunto, Polar and Wahoo
+    // watches too, which athletica-app names only when this returns 'unknown' (see the comment on
+    // $enum_data['product']). Matching the suffix covers IDs that later SDK releases add (23, 24 in 21.222.0).
+    private const UNNAMED_PRODUCT_SUFFIX = '_single_byte_product_id';
 
     private const BASE_TYPE_STRING = 0x07;
     private const BASE_TYPE_BYTE = 0x0D;
@@ -2842,11 +2843,8 @@ class phpFITFileAnalysis
         if (isset($this->enum_data[$type][$value])) {
             return $this->enum_data[$type][$value];
         }
-        if ($type === 'product' && in_array($value, self::UNNAMED_PRODUCT_IDS, true)) {
-            return 'unknown';
-        }
         $name = Profile::TYPES[self::ENUM_TYPE_ALIASES[$type] ?? $type][$value] ?? null;
-        if ($name === null) {
+        if ($name === null || ($type === 'product' && str_ends_with($name, self::UNNAMED_PRODUCT_SUFFIX))) {
             return 'unknown';
         }
 
